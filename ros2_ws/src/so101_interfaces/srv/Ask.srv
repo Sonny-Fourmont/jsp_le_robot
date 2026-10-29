@@ -1,0 +1,6 @@
+# Ask a question to the Ouija robot: it picks an answer and spells it with the planchette.
+string question
+---
+bool success
+string answer      # the text that was spelled
+string message

@@ -1,0 +1,140 @@
+# Launch:
+#   xhost +local:docker            # once per session (X11 access)
+#   cp .env.example .env           # once, then edit it (sim or real arm)
+#   docker compose up -d control viz
+#
+# RViz runs INSIDE the control container (X11 forwarded), so on the internal
+# DDS network - no need for --network host:
+#   docker compose exec control bash -lc "source /ros2_ws/install/setup.bash && rviz2 -d /ros2_ws/so101.rviz"
+#
+# ROS_DOMAIN_ID (set in .env) isolates groups sharing a machine.
+
+name: tek5
+
+# Shared ROS environment for all services.
+x-ros-env: &ros-env
+  ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-42}
+  FASTDDS_BUILTIN_TRANSPORTS: LARGE_DATA
+
+services:
+  control:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.control
+    image: tek5/control
+    init: true
+    environment:
+      <<: *ros-env
+      USE_SIM: ${USE_SIM:-true}
+      SIM_SCENE: ${SIM_SCENE:-}
+      CAMERA_TF: ${CAMERA_TF:-sim}
+      REAL_ROBOT_PORT: ${REAL_ROBOT_PORT:-/dev/ttyACM0}
+      ARM_TORQUE: ${ARM_TORQUE:-true}
+      ARM_MAX_STEP: ${ARM_MAX_STEP:-0}
+      ARM_MAX_SPEED: ${ARM_MAX_SPEED:-1.0}
+      MUJOCO_GL: osmesa
+      DISPLAY: ${DISPLAY}
+      QT_QPA_PLATFORM: xcb        # robust X11 and XWayland
+    device_cgroup_rules:  # Grant permissions to access usb serial devices (real arm)
+      - 'c 166:* rmw'
+      - 'c 188:* rmw'
+    volumes:
+      - ../ros2_ws:/ros2_ws
+      - ../sim:/opt/so101/sim
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - ./control_entrypoint.sh:/opt/so101/entrypoint.sh:ro
+      - ${CALIBRATION_FILE:-/dev/null}:/calibration/arm.json:ro
+    networks: [rosnet]
+    stdin_open: true
+    tty: true
+    # Only container that builds (concurrent colcon on the same volume = conflicts).
+    # viz waits for install/ to be ready.
+    command: ["/opt/so101/entrypoint.sh"]
+
+  # robot_state_publisher: publishes /robot_description and the TFs from
+  # /joint_states (provided by your driver_node). Visualization is done
+  # with RViz from the control container.
+  viz:
+    image: tek5/control
+    init: true
+    environment: *ros-env
+    volumes:
+      - ../ros2_ws:/ros2_ws
+    networks: [rosnet]
+    command: >
+      bash -lc "source /opt/ros/jazzy/setup.bash &&
+      until [ -f /ros2_ws/install/setup.bash ] && [ -f /ros2_ws/install/so101_description/share/so101_description/launch/viz.launch.py ]; do echo 'waiting for build (control)...'; sleep 1; done &&
+      cd /ros2_ws && source install/setup.bash &&
+      ros2 launch so101_description viz.launch.py"
+
+  # perception_node: camera image -> 3D positions of the object and the drop box.
+  # Own image (Dockerfile.perception), own container; waits for the build done by control.
+  perception:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.perception
+    image: tek5/perception
+    init: true
+    environment:
+      <<: *ros-env
+      CAMERA_TF: ${CAMERA_TF:-sim}
+    volumes:
+      - ../ros2_ws:/ros2_ws
+      - ../sim:/opt/so101/sim:ro   # Ouija board layout (ouija_layout.json), calibration sheet (calib_sheet.json)
+    networks: [rosnet]
+    command: >
+      bash -lc "source /opt/ros/jazzy/setup.bash &&
+      until [ -f /ros2_ws/install/setup.bash ] && [ -f /ros2_ws/install/so101_perception/share/so101_perception/launch/perception.launch.py ]; do echo 'waiting for build (control)...'; sleep 1; done &&
+      cd /ros2_ws && source install/setup.bash &&
+      ros2 launch so101_perception perception.launch.py camera_tf:=${CAMERA_TF:-sim}"
+
+  # Real USB camera (UVC): publishes /external_cam/image_raw + camera_info like the sim
+  # camera of the driver, so perception does not know the difference. Not started by
+  # default (profile "real"): with USE_SIM=false (or to try a webcam),
+  #   docker compose build camera          # once
+  #   docker compose up -d camera          # device, size, fps: CAMERA_* in .env
+  # Intrinsics (once per camera, checkerboard, autofocus off), saved to ros2_ws/calibration/:
+  #   docker compose exec camera bash -lc "source /opt/ros/jazzy/setup.bash && ros2 run camera_calibration cameracalibrator --size 8x6 --square 0.025 --no-service-check --ros-args -r image:=/external_cam/image_raw -r camera:=/external_cam"
+  camera:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.camera
+    image: tek5/camera
+    init: true
+    profiles: ["real"]
+    environment:
+      <<: *ros-env
+      DISPLAY: ${DISPLAY}
+      QT_QPA_PLATFORM: xcb
+    devices:
+      - ${CAMERA_DEVICE:-/dev/video0}:/dev/video0
+    volumes:
+      - ../ros2_ws:/ros2_ws
+      - /tmp/.X11-unix:/tmp/.X11-unix
+    networks: [rosnet]
+    command: >
+      bash -lc "source /opt/ros/jazzy/setup.bash &&
+      ros2 run v4l2_camera v4l2_camera_node --ros-args -r __ns:=/external_cam
+      -p video_device:=/dev/video0
+      -p image_size:=[${CAMERA_WIDTH:-640},${CAMERA_HEIGHT:-480}]
+      -p pixel_format:=${CAMERA_PIXEL_FORMAT:-YUYV}
+      -p output_encoding:=${CAMERA_ENCODING:-rgb8}
+      -p camera_frame_id:=external_cam_optical
+      -p camera_info_url:=file:///ros2_ws/calibration/camera_info.yaml
+      -p time_per_frame:=[1,${CAMERA_FPS:-10}]"
+
+  # Local language model for the Ouija "spirit" (phase 2): free, offline, CPU only.
+  # First use: docker compose exec ollama ollama pull qwen2.5:1.5b   (about 1 GB)
+  ollama:
+    image: ollama/ollama
+    init: true
+    volumes:
+      - ollama_models:/root/.ollama
+    networks: [rosnet]
+
+networks:
+  rosnet:
+    driver: bridge
+
+volumes:
+  ollama_models:

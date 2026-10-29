@@ -1,0 +1,20 @@
+# CAMERA container — real USB (UVC) camera for the perception stack.
+# Own layer on top of the perception image (see Dockerfile.perception, "add what you need").
+#   docker compose build camera
+# Provides:
+#   v4l2_camera          -> /external_cam/image_raw + /external_cam/camera_info
+#   camera_calibration   -> intrinsics (K, distortion) with a checkerboard, GUI via X11
+FROM tek5/perception
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ros-jazzy-v4l2-camera \
+    ros-jazzy-camera-calibration \
+    ros-jazzy-image-transport-plugins \
+    v4l-utils \
+    && rm -rf /var/lib/apt/lists/* \
+    # cameracalibrator needs the GUI build of OpenCV (python3-opencv from apt, pulled above),
+    # which the pip headless build would shadow.
+    && pip uninstall -y --break-system-packages opencv-python-headless
+
+WORKDIR /ros2_ws
+CMD ["bash", "-lc", "source /opt/ros/jazzy/setup.bash && bash"]

@@ -1,0 +1,8 @@
+# Straight-line motion of the TCP in the world frame, from its current position to
+# target_pose.position. The gripper keeps the approach direction given by the z axis of
+# target_pose.orientation (identity quaternion = pointing down).
+geometry_msgs/PoseStamped target_pose
+float64 speed      # m/s along the line, 0 = default (0.05)
+---
+bool success
+string message
