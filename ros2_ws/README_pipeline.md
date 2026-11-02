@@ -80,6 +80,12 @@ trou 1,1 cm) : la pointe de la pince fermée descend dans le trou et le tire dan
 quelle direction (un palet poussé par la pointe arrondie glissait de côté). La caméra est
 au-dessus du bord éloigné de la planche, inclinée de 20° vers le robot.
 
+**Impression du plateau (vrai robot)** : `python3 sim/so101_sim/assets/so101/ouija/make_board_print.py`
+-> `ouija_board_A4.pdf`, 4 pages A4 à imprimer à 100 % (quarts de 15 x 25 cm, fond blanc),
+à couper sur le cadre noir et assembler bord à bord sur un carton : le plateau fait
+30 x 50 cm, exactement la géométrie de la simu (`ouija_layout.json`). La planchette est
+un anneau bleu à fabriquer (impression 3D) : diamètre 42 mm, trou 22 mm, hauteur 15 mm.
+
 ```bash
 # dans un shell ROS du conteneur control
 ros2 service call /ouija/ask so101_interfaces/srv/Ask "{question: 'est-ce que tu es vivant ?'}"
@@ -216,6 +222,26 @@ ros2 service call /set_joint_positions so101_interfaces/srv/SetJointPositions "{
 ros2 service call /go_to_target so101_interfaces/srv/GoToTarget "{target_pose: {header: {frame_id: world}, pose: {position: {x: 0.25, y: 0.0, z: 0.10}}}}"
 # 4. avant d'arrêter : pose de repos, puis docker compose stop control
 ```
+
+### Premier contact réel (29 octobre 2026) : résultats
+
+- Le fichier de calibration du 9 octobre ne correspondait pas aux moteurs (tous les offsets
+  différents). La calibration stockée dans les moteurs a été relue avec LeRobot
+  (`bus.read_calibration()`) et sauvée dans `calibration/so101_follower_from_motors_2026-10-29.json`,
+  qui est maintenant `CALIBRATION_FILE`. Même convention que le modèle : la pose
+  d'observation [0, -100, 40, -80, 0] donne le même bras que la simu (pince en haut,
+  derrière la base).
+- Alimentation : une première alim donnait 20 V (servos en « Input voltage error », limite
+  14 V, ils refusent de bouger). Avec la bonne alim : 9 V (12 V = couple nominal).
+- Pose de repos repliée lue à la main : pan 0, lift -105, elbow 99, wrist_flex 48,
+  roll -87 (deg).
+- Mouvements : `/set_joint_positions` suit à 1° près. `/go_to_target` (0,25, 0, 0,12) :
+  erreur 8,8 mm et 12,7° sur l'axe d'approche, surtout du fléchissement sous gravité
+  (gain P des servos mis à 16 par LeRobot, 9 V). Le plafond `ARM_MAX_STEP=0.1` s'est
+  déclenché sur `shoulder_lift` pendant ce mouvement (le servo prend du retard sur la
+  trajectoire) : il ralentit sans bloquer.
+- Pour lire le bus en dehors du driver (tension, calibration) : arrêter le driver d'abord,
+  un seul programme peut ouvrir `/dev/ttyACM0`.
 
 ### Caméra réelle
 

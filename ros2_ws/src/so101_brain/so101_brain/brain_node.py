@@ -80,6 +80,11 @@ class BrainNode(rclpy.node.Node):
         self._tcp_id = self._model.getFrameId(TCP_FRAME)
         self._q_lo = np.array(self._model.lowerPositionLimit[:5]) + IK_LIMIT_MARGIN
         self._q_hi = np.array(self._model.upperPositionLimit[:5]) - IK_LIMIT_MARGIN
+        # Wrist roll kept within +/- wrist_roll_limit_deg: the jaws are symmetric, so any jaw
+        # direction is reachable within +/- 90 deg, and a cable (wrist camera) runs to the gripper
+        # on the real arm: it got unplugged at 159 deg.
+        roll_lim = math.radians(float(self.declare_parameter("wrist_roll_limit_deg", 90.0).value))
+        self._q_lo[4], self._q_hi[4] = max(self._q_lo[4], -roll_lim), min(self._q_hi[4], roll_lim)
 
         # ---- state (updated by /joint_states)
         self._lock = threading.Lock()
@@ -182,12 +187,14 @@ class BrainNode(rclpy.node.Node):
         """Damped least squares IK on the 5 arm joints.
 
         Tasks: TCP position (3) + TCP z axis aligned with approach_dir (2 effective).
-        x_dir (optional): desired direction of the TCP x axis (the jaw axis), obtained
-        afterwards with the wrist roll, which is free when the gripper points down.
+        x_dir (optional, default world x): desired direction of the TCP x axis (the jaw axis),
+        obtained afterwards with the wrist roll, which is free when the gripper points down.
         Returns (q_arm, pos_error_m, axis_error) for the best solution found.
         """
         q_arm, pos_err, axis_err = self._solve_ik_position_axis(target_position, approach_dir, q_seed)
-        if q_arm is not None and x_dir is not None:
+        if x_dir is None:
+            x_dir = (1.0, 0.0, 0.0)  # default: jaws along the robot x axis (roll near 0, never left random)
+        if q_arm is not None:
             q_arm = self._align_roll(q_arm, x_dir)
         return q_arm, pos_err, axis_err
 
