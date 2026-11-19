@@ -1,0 +1,24 @@
+# HSV thresholds for the REAL camera (OpenCV ranges: H 0-179, S 0-255, V 0-255).
+# Loaded by perception.launch.py when PERCEPTION_PARAMS points here (docker/.env).
+# Tune them under the real light with:  ./run.sh hsv   (prints the values to paste below)
+# then:  docker compose restart perception
+# The values below are the simulation defaults: a good starting point for a matte red
+# cube, an orange/brown box and a blue ring, to be adjusted on site.
+so101_perception:
+  ros__parameters:
+    # red cube: the hue wraps around 0, hence two ranges
+    object_hsv_low1: [160, 90, 60]
+    object_hsv_high1: [179, 255, 255]
+    object_hsv_low2: [0, 90, 60]
+    object_hsv_high2: [8, 255, 255]
+    min_blob_area_px: 40
+    # Drop box colour and detection plane heights: on the real arm they come from
+    # ros2_ws/calibration/workspace.yaml (box_hsv_low/high, object_plane_h, box_plane_h, table plane),
+    # do NOT set them here, a value here would override that file. Simulation defaults for reference:
+    #   box_hsv_low: [5, 80, 40]   box_hsv_high: [22, 255, 160]   (orange box)
+    #   object_plane_z: 0.025      box_plane_z: 0.025
+ouija_perception:
+  ros__parameters:
+    # blue ring (planchette)
+    planchette_hsv_low: [100, 120, 80]
+    planchette_hsv_high: [130, 255, 255]

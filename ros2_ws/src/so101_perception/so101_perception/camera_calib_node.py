@@ -29,7 +29,7 @@ import rclpy
 import rclpy.node
 from cv_bridge import CvBridge
 from geometry_msgs.msg import TransformStamped
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import String
 from tf2_ros import Buffer, StaticTransformBroadcaster, TransformListener
@@ -142,7 +142,8 @@ class CameraCalibNode(rclpy.node.Node):
 
         qos = QoSProfile(depth=2, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.create_subscription(CameraInfo, f"{self._camera_topic}/camera_info", self._cb_camera_info, 5)
-        self.create_subscription(Image, f"{self._camera_topic}/image_raw", self._cb_image, 2)
+        # Best Effort, like the camera publisher (sim driver or real camera): see README "QoS".
+        self.create_subscription(Image, f"{self._camera_topic}/image_raw", self._cb_image, qos_profile_sensor_data)
         self._pub_debug = self.create_publisher(Image, "/camera_calib/debug_image", qos)
         self._pub_status = self.create_publisher(String, "/camera_calib/status", 5)
         self.create_timer(1.0, self._publish_status)

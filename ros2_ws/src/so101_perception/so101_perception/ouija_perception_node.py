@@ -17,12 +17,14 @@ import json
 from pathlib import Path
 
 import cv2
+import time
+
 import numpy as np
 import rclpy
 import rclpy.node
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Point, PoseStamped
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import String
 from tf2_ros import Buffer, TransformListener
@@ -89,7 +91,8 @@ class OuijaPerceptionNode(rclpy.node.Node):
 
         qos = QoSProfile(depth=2, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.create_subscription(CameraInfo, f"{self._camera_topic}/camera_info", self._cb_camera_info, 5)
-        self.create_subscription(Image, f"{self._camera_topic}/image_raw", self._cb_image, 2)
+        # Best Effort, like the camera publisher (sim driver or real camera): see README "QoS".
+        self.create_subscription(Image, f"{self._camera_topic}/image_raw", self._cb_image, qos_profile_sensor_data)
         self._pub_board = self.create_publisher(PoseStamped, "/ouija/board_pose", 5)
         self._pub_puck = self.create_publisher(PoseStamped, "/ouija/planchette_position", 5)
         self._pub_pointed = self.create_publisher(String, "/ouija/pointed", 5)
@@ -111,16 +114,23 @@ class OuijaPerceptionNode(rclpy.node.Node):
     def _fetch_cam_params(self) -> bool:
         if self._K is None or not self._camera_frame:
             return False
-        if self._T_wc is None:
+        # Re-read the camera pose every 2 s: it changes when the camera is recalibrated or when
+        # the simulator restarts with another scene (the Ouija scene has its own camera).
+        now = time.monotonic()
+        if self._T_wc is None or now - getattr(self, "_T_wc_time", 0.0) > 2.0:
             try:
                 tf = self._tf_buffer.lookup_transform(self._world_frame, self._camera_frame, rclpy.time.Time())
             except Exception:  # noqa: BLE001
-                return False
+                return self._T_wc is not None
             t, q = tf.transform.translation, tf.transform.rotation
-            self._T_wc = np.eye(4)
-            self._T_wc[:3, :3] = _quat_to_matrix(q.x, q.y, q.z, q.w)
-            self._T_wc[:3, 3] = [t.x, t.y, t.z]
-            self.get_logger().info(f"camera pose received: t={np.round(self._T_wc[:3, 3], 3)}")
+            T = np.eye(4)
+            T[:3, :3] = _quat_to_matrix(q.x, q.y, q.z, q.w)
+            T[:3, 3] = [t.x, t.y, t.z]
+            if self._T_wc is None or np.max(np.abs(T - self._T_wc)) > 1e-6:
+                what = "received" if self._T_wc is None else "updated"
+                self._T_wc = T
+                self.get_logger().info(f"camera pose {what}: t={np.round(T[:3, 3], 3)}")
+            self._T_wc_time = now
         return True
 
     # ------------------------------------------------------------------ board

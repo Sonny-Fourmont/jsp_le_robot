@@ -2,3 +2,7 @@ __pycache__/
 
 .env
 !.env.example
+ros2_ws/rec/
+docs/other/
+commande.txt
+docs/vrai_robot_jourJ.md
