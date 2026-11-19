@@ -1,5 +1,9 @@
 <mujoco model="tek5_pick_and_place">
     <include file="so101_tek5.xml" />
+    <!-- Grasping: MuJoCo's default soft friction lets a clamped object creep out of the jaws
+         (the 40 g cube slid down 2 cm during a lift and fell during the pan). Stiffer friction
+         constraints + the no-slip solver, as recommended by MuJoCo for manipulation. -->
+    <option impratio="10" noslip_iterations="5" />
 
     <visual>
         <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0" />
@@ -75,8 +79,10 @@
         </body>
 
         <!-- Fixed external camera (eye-to-hand), KNOWN pose: this is the reference
-             camera->world TF. Looks at the workspace from above/the side. -->
+             camera->world TF. Looks at the workspace from above/the side. fovy 70 so that the
+             whole random drop zone of the cube (r 18-30 cm, -50..60 deg) stays inside the image:
+             a blob cut by the image border has a biased centroid (the perception skips it). -->
         <camera name="external_cam" pos="0.45 0.45 0.55" xyaxes="-0.707 0.707 0 -0.354 -0.354 0.866"
-            fovy="52" />
+            fovy="70" />
     </worldbody>
 </mujoco>

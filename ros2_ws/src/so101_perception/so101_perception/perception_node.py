@@ -10,6 +10,7 @@ Publishes /object_position and /drop_box_position (geometry_msgs/PoseStamped, fr
 world) at the image rate, plus /perception/debug_image for RViz.
 """
 import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -17,8 +18,8 @@ import cv2
 import rclpy
 import rclpy.node
 from cv_bridge import CvBridge
-from geometry_msgs.msg import PoseStamped
-from rclpy.qos import QoSProfile, ReliabilityPolicy
+from geometry_msgs.msg import PoseStamped, Point
+from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image
 from tf2_ros import Buffer, TransformListener
 from visualization_msgs.msg import Marker
@@ -77,7 +78,8 @@ class PerceptionNode(rclpy.node.Node):
 
         qos = QoSProfile(depth=2, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.create_subscription(CameraInfo, f"{self._camera_topic}/camera_info", self._cb_camera_info, 5)
-        self.create_subscription(Image, f"{self._camera_topic}/image_raw", self._cb_image, 2)
+        # Best Effort, like the camera publisher (sim driver or real camera): see README "QoS".
+        self.create_subscription(Image, f"{self._camera_topic}/image_raw", self._cb_image, qos_profile_sensor_data)
         self._pub_object = self.create_publisher(PoseStamped, "/object_position", 5)
         self._pub_box = self.create_publisher(PoseStamped, "/drop_box_position", 5)
         self._pub_debug = self.create_publisher(Image, "/perception/debug_image", qos)
@@ -99,17 +101,23 @@ class PerceptionNode(rclpy.node.Node):
         """K from CameraInfo, camera pose from tf2 (static TF published by the driver)."""
         if self._K is None or not self._camera_frame:
             return False
-        if self._T_wc is None:
+        # Re-read the camera pose every 2 s: it changes when the camera is recalibrated or when
+        # the simulator restarts with another scene (the Ouija scene has its own camera).
+        now = time.monotonic()
+        if self._T_wc is None or now - getattr(self, "_T_wc_time", 0.0) > 2.0:
             try:
                 tf = self._tf_buffer.lookup_transform(self._world_frame, self._camera_frame, rclpy.time.Time())
             except Exception:  # noqa: BLE001 - TF not available yet
-                return False
-            t = tf.transform.translation
-            q = tf.transform.rotation
-            self._T_wc = np.eye(4)
-            self._T_wc[:3, :3] = self._quat_to_matrix(q.x, q.y, q.z, q.w)
-            self._T_wc[:3, 3] = [t.x, t.y, t.z]
-            self.get_logger().info(f"camera pose received: t={np.round(self._T_wc[:3, 3], 3)}")
+                return self._T_wc is not None
+            t, q = tf.transform.translation, tf.transform.rotation
+            T = np.eye(4)
+            T[:3, :3] = self._quat_to_matrix(q.x, q.y, q.z, q.w)
+            T[:3, 3] = [t.x, t.y, t.z]
+            if self._T_wc is None or np.max(np.abs(T - self._T_wc)) > 1e-6:
+                what = "received" if self._T_wc is None else "updated"
+                self._T_wc = T
+                self.get_logger().info(f"camera pose {what}: t={np.round(T[:3, 3], 3)}")
+            self._T_wc_time = now
         return True
 
     @staticmethod
@@ -135,10 +143,15 @@ class PerceptionNode(rclpy.node.Node):
         box = self._detect_object(box_mask)
 
         debug = rgb.copy()
-        if obj is not None and self._ignore_radius > 0.0:
+        if obj is not None and self._ignore_radius > 0.0:  # real arm: the red clamp of the base
             P0 = self._project_to_3d(*obj[:2], self._object_plane_z)
             if P0 is not None and float(np.hypot(P0[0], P0[1])) < self._ignore_radius:
                 obj = None
+        if obj is not None and self._touches_border(obj[3], rgb.shape):
+            # a blob cut by the image border has a wrong centroid: do not publish it
+            self.get_logger().warn("object partly out of the camera view, detection skipped", throttle_duration_sec=2.0)
+            self._annotate(debug, obj, None, (255, 80, 80), "object (bord)")
+            obj = None
         if obj is not None:
             P = self._project_to_3d(*obj[:2], self._object_plane_z)
             P = None if P is None else P + self._xy_offset
@@ -156,6 +169,11 @@ class PerceptionNode(rclpy.node.Node):
             out = self._bridge.cv2_to_imgmsg(debug, encoding="rgb8")
             out.header = msg.header
             self._pub_debug.publish(out)
+
+    @staticmethod
+    def _touches_border(bbox, shape, margin=2):
+        x, y, w, h = bbox
+        return x <= margin or y <= margin or x + w >= shape[1] - margin or y + h >= shape[0] - margin
 
     def _detect_object(self, mask):
         """Largest blob of the mask -> (u, v, area, bbox) or None."""
@@ -191,17 +209,26 @@ class PerceptionNode(rclpy.node.Node):
         pub.publish(msg)
 
     def _publish_marker(self, P, stamp):
-        """Green 5 cm cube in RViz at the detected object position."""
+        """Green 5 cm wireframe cube in RViz at the detected object position (wireframe: the
+        simulation's ground-truth cube, /debug/sim_markers, stays visible inside it)."""
         if P is None:
             return
         m = Marker()
         m.header.stamp = stamp
         m.header.frame_id = self._world_frame
-        m.ns, m.id, m.type, m.action = "object", 0, Marker.CUBE, Marker.ADD
+        m.ns, m.id, m.type, m.action = "object", 0, Marker.LINE_LIST, Marker.ADD
         m.pose.position.x, m.pose.position.y, m.pose.position.z = map(float, P)
         m.pose.orientation.w = 1.0
-        m.scale.x = m.scale.y = m.scale.z = 0.05
-        m.color.r, m.color.g, m.color.b, m.color.a = 0.1, 0.9, 0.2, 0.6
+        m.scale.x = 0.003
+        m.color.r, m.color.g, m.color.b, m.color.a = 0.1, 0.9, 0.2, 0.9
+        h = 0.025
+        corners = [(sx * h, sy * h, sz * h) for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)]
+        for i, a in enumerate(corners):
+            for j in range(i + 1, 8):
+                b = corners[j]
+                if sum(x != y for x, y in zip(a, b)) == 1:  # edges: corners differing in one axis
+                    m.points.append(Point(x=a[0], y=a[1], z=a[2]))
+                    m.points.append(Point(x=b[0], y=b[1], z=b[2]))
         m.lifetime.sec = 1
         self._pub_marker.publish(m)
 

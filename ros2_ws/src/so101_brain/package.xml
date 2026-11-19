@@ -2,7 +2,7 @@
 <package format="3">
   <name>so101_brain</name>
   <version>0.2.0</version>
-  <description>Intelligence of the arm — IK (ikpy) and autonomous pick &amp; place loop.</description>
+  <description>Intelligence of the arm — FK/IK (pinocchio) and autonomous pick &amp; place loop.</description>
   <maintainer email="tek5@epitech.eu">Tek5 Robotics</maintainer>
   <license>Apache-2.0</license>
 
