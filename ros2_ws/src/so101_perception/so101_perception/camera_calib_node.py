@@ -10,8 +10,9 @@ layouts, `sheet_poses` their poses (4 numbers each). The marker corners are expr
 the world frame, so solvePnP on all the detected corners gives T_camera_world directly,
 whatever the sheets seen (ids are distinct: 0-3 board, 10-13 sheet).
 `num_samples` estimates are averaged, the static TF is published (replacing the ground
-truth of the simulator, see `publish_camera_tf` in the driver) and saved to `calib_file`
-so the sheet can be removed afterwards: with `mode: load` the saved TF is re-published.
+truth of the simulator, see `publish_camera_tf` in the driver) and, when it publishes the
+TF (real camera), saved to `calib_file` so the sheet can be removed afterwards: with
+`mode: load` the saved TF is re-published. A simulation run never overwrites that file.
 
 In simulation the driver still publishes the ground truth as `external_cam_optical_gt`
 (`gt_frame`): the node logs the error of its estimate against it.
@@ -227,7 +228,11 @@ class CameraCalibNode(rclpy.node.Node):
         self._compare_with_ground_truth()
         if self._publish_tf:
             self._send_tf()
-        self._save()
+            self._save()
+        else:
+            # camera_tf:=sim: evaluation against the simulator only; the saved calibration of the
+            # real camera (calibration/camera_tf.json, versioned) must not be overwritten by a sim run
+            self.get_logger().info(f"evaluation only (publish_tf=false): {self._calib_file} left untouched")
 
     def _compare_with_ground_truth(self):
         try:
