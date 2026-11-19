@@ -9,6 +9,9 @@ Pipeline (see J3 slides "from pixel to 3D"):
 Publishes /object_position and /drop_box_position (geometry_msgs/PoseStamped, frame
 world) at the image rate, plus /perception/debug_image for RViz.
 """
+import os
+from pathlib import Path
+
 import numpy as np
 import cv2
 import rclpy
@@ -21,6 +24,18 @@ from tf2_ros import Buffer, TransformListener
 from visualization_msgs.msg import Marker
 
 
+WORKSPACE_FILE = Path("/ros2_ws/calibration/workspace.yaml")
+
+
+def load_workspace():
+    """Real-robot workspace settings (calibration/workspace.yaml), {} in simulation or if absent."""
+    if os.environ.get("USE_SIM", "true").lower() == "true" or not WORKSPACE_FILE.is_file():
+        return {}
+    import yaml
+
+    return yaml.safe_load(WORKSPACE_FILE.read_text()) or {}
+
+
 class PerceptionNode(rclpy.node.Node):
     """Red cube + drop box detection, pixel -> 3D by ray/plane intersection."""
 
@@ -30,16 +45,28 @@ class PerceptionNode(rclpy.node.Node):
         self._camera_topic = p("camera_topic", "/external_cam").value
         self._world_frame = p("world_frame", "world").value
         # Height of the plane used to intersect the viewing ray, per target (m).
-        self._object_plane_z = p("object_plane_z", 0.025).value  # 5 cm cube -> its centre
-        self._box_plane_z = p("box_plane_z", 0.025).value
+        # Plane z(x) = table_z0 + table_slope * (x - table_x0) + h (the table can be tilted in the robot
+        # frame on the real arm, see calibration/workspace.yaml); h = plane_z below. Sim: z = h.
+        ws = load_workspace()
+        tb = ws.get("table", {})
+        self._table_x0 = float(tb.get("x0", 0.0))
+        self._table_z0 = float(tb.get("z0", 0.0))
+        self._table_slope = float(tb.get("slope", 0.0))
+        # Detections closer than this to the robot base (m) are ignored: on the real arm the red clamp of
+        # the base looks like the cube. 0 = off (simulation).
+        self._ignore_radius = float(p("ignore_radius", float(ws.get("ignore_radius", 0.0))).value)
+        # Offset (x, y) added to the camera positions to express them in the arm's frame (real arm).
+        self._xy_offset = np.array([*[float(v) for v in ws.get("xy_offset", [0.0, 0.0])], 0.0])
+        self._object_plane_z = p("object_plane_z", float(ws.get("object_plane_h", 0.025))).value  # cube centre
+        self._box_plane_z = p("box_plane_z", float(ws.get("box_plane_h", 0.025))).value
         self._min_area = p("min_blob_area_px", 40).value
         # HSV thresholds (OpenCV: H 0-179). Red wraps around 0, hence two ranges.
         self._obj_lo1 = np.array(p("object_hsv_low1", [160, 90, 60]).value, dtype=np.uint8)
         self._obj_hi1 = np.array(p("object_hsv_high1", [179, 255, 255]).value, dtype=np.uint8)
         self._obj_lo2 = np.array(p("object_hsv_low2", [0, 90, 60]).value, dtype=np.uint8)
         self._obj_hi2 = np.array(p("object_hsv_high2", [8, 255, 255]).value, dtype=np.uint8)
-        self._box_lo = np.array(p("box_hsv_low", [5, 80, 40]).value, dtype=np.uint8)
-        self._box_hi = np.array(p("box_hsv_high", [22, 255, 160]).value, dtype=np.uint8)
+        self._box_lo = np.array(p("box_hsv_low", ws.get("box_hsv_low", [5, 80, 40])).value, dtype=np.uint8)
+        self._box_hi = np.array(p("box_hsv_high", ws.get("box_hsv_high", [22, 255, 160])).value, dtype=np.uint8)
 
         self._bridge = CvBridge()
         self._K = None
@@ -108,13 +135,19 @@ class PerceptionNode(rclpy.node.Node):
         box = self._detect_object(box_mask)
 
         debug = rgb.copy()
+        if obj is not None and self._ignore_radius > 0.0:
+            P0 = self._project_to_3d(*obj[:2], self._object_plane_z)
+            if P0 is not None and float(np.hypot(P0[0], P0[1])) < self._ignore_radius:
+                obj = None
         if obj is not None:
             P = self._project_to_3d(*obj[:2], self._object_plane_z)
+            P = None if P is None else P + self._xy_offset
             self._publish_result(self._pub_object, P, msg.header.stamp)
             self._publish_marker(P, msg.header.stamp)
             self._annotate(debug, obj, P, (0, 255, 0), "object")
         if box is not None:
             P = self._project_to_3d(*box[:2], self._box_plane_z)
+            P = None if P is None else P + self._xy_offset
             self._publish_result(self._pub_box, P, msg.header.stamp)
             self._annotate(debug, box, P, (0, 200, 255), "box")
 
@@ -136,15 +169,16 @@ class PerceptionNode(rclpy.node.Node):
             return None
         return m["m10"] / m["m00"], m["m01"] / m["m00"], m["m00"], cv2.boundingRect(c)
 
-    def _project_to_3d(self, u, v, plane_z):
-        """Pixel -> world point on the horizontal plane z = plane_z."""
+    def _project_to_3d(self, u, v, plane_h):
+        """Pixel -> world point on the plane z = table(x) + plane_h (horizontal in simulation)."""
         ray_cam = np.linalg.inv(self._K) @ np.array([u, v, 1.0])
-        ray_w = self._T_wc[:3, :3] @ ray_cam
-        origin = self._T_wc[:3, 3]
-        if abs(ray_w[2]) < 1e-9:
+        d = self._T_wc[:3, :3] @ ray_cam
+        o = self._T_wc[:3, 3]
+        den = d[2] - self._table_slope * d[0]
+        if abs(den) < 1e-9:
             return None
-        s = (plane_z - origin[2]) / ray_w[2]
-        return origin + s * ray_w if s > 0 else None
+        t = (self._table_z0 + plane_h + self._table_slope * (o[0] - self._table_x0) - o[2]) / den
+        return o + t * d if t > 0 else None
 
     def _publish_result(self, pub, P, stamp):
         if P is None:

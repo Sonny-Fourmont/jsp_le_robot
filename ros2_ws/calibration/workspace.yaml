@@ -1,0 +1,31 @@
+# Réglages du plan de travail du VRAI robot (USE_SIM=false). Ignoré en simulation.
+# Hauteur de la table dans le repère robot, mesurée avec touch_table.py (pince VERTICALE, posture de la
+# saisie), le 2026-11-19 : z = -0.020 à x = 0.20 et z = -0.015 à x = 0.28 -> table plane à -0.0175
+# (l'écart de 5 mm est dans l'incertitude du contact). Pointe posée sur le dessus du cube (compare_touch.py) :
+# z=0.025 -> table à -0.025 ; moyenne retenue : -0.021. Surface : z(x) = z0 + slope * (x - x0).
+# (Mesure faite pince inclinée : -0.0281 à x=0.19 et -0.0385 à x=0.34, 2 cm plus bas : ne pas l'utiliser.)
+table:
+  x0: 0.24
+  z0: -0.021
+  slope: 0.0
+
+# Pose du centre de la feuille ArUco dans le repère robot : x, y, z (m), yaw (deg) de son axe x.
+# (feuille posée avec ses marqueurs id 10/11 côté éloigné du robot, alignée à 1,4° de l'axe x)
+sheet_pose: [0.3389, -0.0031, -0.021, -91.4]
+
+# Hauteur du plan d'intersection du rayon de vue, au-dessus de la table (m).
+object_plane_h: 0.025   # centre du cube de 5 cm
+box_plane_h: 0.04       # milieu du bol
+
+# Détection du bol vert (HSV OpenCV : H 0-179). Le cube rouge garde les seuils par défaut.
+box_hsv_low: [35, 60, 60]
+box_hsv_high: [85, 255, 255]
+
+# Rayon (m) autour de la base en dessous duquel une détection rouge est ignorée (serre-joint rouge de
+# la fixation du robot, vu comme un cube). Le cube doit rester au-delà (portée minimale ~13 cm).
+ignore_radius: 0.12
+
+# Décalage (m) ajouté en x, y aux positions vues par la caméra (cube et bol) pour les exprimer dans le
+# repère du bras en posture de saisie (pince verticale). Mesuré avec compare_touch.py, pointe sur le
+# dessus du cube : pointe - caméra = (+0.0201, +0.0010) puis (+0.0179, +0.0058), cube vers x=0.22, y=-0.05.
+xy_offset: [0.019, 0.0034]

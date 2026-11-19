@@ -6,6 +6,9 @@
   - perception: phase 1, red cube + drop box -> 3D;
   - ouija_perception: phase 2, Ouija board (ArUco) + planchette -> 3D
     (idle if no board is visible, so both can always run)."""
+import os
+from pathlib import Path
+
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration, PythonExpression
@@ -13,7 +16,21 @@ from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
 
+def _real_sheet_pose():
+    """Pose of the A4 sheet measured on the real arm (calibration/workspace.yaml), None in simulation."""
+    f = Path("/ros2_ws/calibration/workspace.yaml")
+    if os.environ.get("USE_SIM", "true").lower() == "true" or not f.is_file():
+        return None
+    import yaml
+
+    return (yaml.safe_load(f.read_text()) or {}).get("sheet_pose")
+
+
 def generate_launch_description():
+    sheet = _real_sheet_pose()
+    # [x, y, z, yaw] of the A4 sheet, then of the Ouija board (sim values, unused on the real arm).
+    calib_default = ("[%s, 0.235, 0.0, 0.004, 0.0]" % ", ".join(str(v) for v in sheet)) if sheet \
+        else "[-0.15, 0.20, 0.001, 0.0, 0.235, 0.0, 0.004, 0.0]"
     return LaunchDescription([
         DeclareLaunchArgument(
             "ouija_layout",
@@ -32,7 +49,7 @@ def generate_launch_description():
                         "and the Ouija board (make_board.py); whichever is seen is used",
         ),
         DeclareLaunchArgument(
-            "calib_poses", default_value="[-0.15, 0.20, 0.001, 0.0, 0.235, 0.0, 0.004, 0.0]",
+            "calib_poses", default_value=calib_default,
             description="centre of each sheet in the robot frame: x, y, z (m), yaw (deg), 4 per sheet; "
                         "must match scene_tek5.xml / scene_ouija.xml in simulation",
         ),
@@ -67,8 +84,8 @@ def generate_launch_description():
             output="screen",
             parameters=[{
                 "camera_topic": "/external_cam",
-                "object_plane_z": 0.025,
-                "box_plane_z": 0.025,
+                # object_plane_z / box_plane_z: defaults in perception_node.py (0.025 in simulation,
+                # calibration/workspace.yaml on the real arm)
             }],
         ),
     ])

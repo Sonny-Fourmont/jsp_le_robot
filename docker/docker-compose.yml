@@ -78,6 +78,7 @@ services:
     environment:
       <<: *ros-env
       CAMERA_TF: ${CAMERA_TF:-sim}
+      USE_SIM: ${USE_SIM:-true}   # false: reads ros2_ws/calibration/workspace.yaml (real arm)
     volumes:
       - ../ros2_ws:/ros2_ws
       - ../sim:/opt/so101/sim:ro   # Ouija board layout (ouija_layout.json), calibration sheet (calib_sheet.json)

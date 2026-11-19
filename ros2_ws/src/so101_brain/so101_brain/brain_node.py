@@ -20,6 +20,7 @@ Never talks to the backend: reads /joint_states, commands through /joint_command
     Current state on /brain/state (std_msgs/String).
 """
 import math
+import os
 import threading
 import time
 
@@ -34,6 +35,19 @@ from sensor_msgs.msg import JointState
 from so101_interfaces.srv import GoToTarget, MoveLine, SetJointPositions
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
+from pathlib import Path
+
+WORKSPACE_FILE = Path("/ros2_ws/calibration/workspace.yaml")
+
+
+def load_table():
+    """(x0, z0, slope) of the table plane in the robot frame on the real arm, (0, 0, 0) in simulation."""
+    if os.environ.get("USE_SIM", "true").lower() == "true" or not WORKSPACE_FILE.is_file():
+        return 0.0, 0.0, 0.0
+    import yaml
+
+    tb = (yaml.safe_load(WORKSPACE_FILE.read_text()) or {}).get("table", {})
+    return float(tb.get("x0", 0.0)), float(tb.get("z0", 0.0)), float(tb.get("slope", 0.0))
 
 ARM_JOINT_NAMES = [
     "shoulder_pan",
@@ -120,6 +134,9 @@ class BrainNode(rclpy.node.Node):
         # Real arm: lower it for the first tests (ARM_MAX_SPEED in docker/.env).
         self._max_joint_speed = float(pp("max_joint_speed", MAX_JOINT_SPEED).value)
         self._observe_joints_deg = pp("observe_joints_deg", [0.0, -80.0, 80.0, 60.0, 0.0]).value
+        self._table_x0, self._table_z0, self._table_slope = load_table()
+        if self._table_z0 or self._table_slope:
+            self.get_logger().info(f"table plane z(x) = {self._table_z0:.4f} + {self._table_slope:.4f} (x - {self._table_x0:.4f})")
         self._approach_height = pp("approach_height", 0.12).value
         self._grasp_height = pp("grasp_height", 0.03).value
         self._lift_height = pp("lift_height", 0.15).value
@@ -523,6 +540,19 @@ class BrainNode(rclpy.node.Node):
                 return
             time.sleep(0.1)
 
+    def _tz(self, x) -> float:
+        """Height of the table at abscissa x (0 in simulation); target heights are above the table.
+        calibration/workspace.yaml is re-read when it changes (no restart needed to tune it)."""
+        try:
+            mtime = WORKSPACE_FILE.stat().st_mtime
+        except OSError:
+            mtime = None
+        if mtime != getattr(self, "_table_mtime", None):
+            self._table_mtime = mtime
+            self._table_x0, self._table_z0, self._table_slope = load_table()
+            self.get_logger().info(f"table plane z(x) = {self._table_z0:.4f} + {self._table_slope:.4f} (x - {self._table_x0:.4f})")
+        return self._table_z0 + self._table_slope * (x - self._table_x0)
+
     def _pick_and_place(self) -> str:
         self._observe()
         obj = self._latest("object", self._max_target_age)
@@ -536,7 +566,7 @@ class BrainNode(rclpy.node.Node):
             # APPROACH above the object, re-plan while it keeps moving.
             self._set_state("APPROACH")
             for _ in range(4):
-                self._move([obj[0], obj[1], self._approach_height], "approach")
+                self._move([obj[0], obj[1], self._tz(obj[0]) + self._approach_height], "approach")
                 fresh = self._latest("object", self._max_target_age)
                 if fresh is None or np.linalg.norm((fresh - obj)[:2]) < self._replan_distance:
                     break
@@ -544,12 +574,12 @@ class BrainNode(rclpy.node.Node):
                 obj = fresh
 
             self._set_state("DESCEND")
-            self._move([obj[0], obj[1], self._grasp_height], "descend")
+            self._move([obj[0], obj[1], self._tz(obj[0]) + self._grasp_height], "descend")
             self._set_state("GRASP")
             self.set_gripper(0.0)
             time.sleep(0.8)
             self._set_state("LIFT")
-            self._move([obj[0], obj[1], self._lift_height], "lift")
+            self._move([obj[0], obj[1], self._tz(obj[0]) + self._lift_height], "lift")
             time.sleep(0.5)
 
             # Grasp check: if the object is still seen where it was, we missed it.
@@ -562,13 +592,13 @@ class BrainNode(rclpy.node.Node):
                 continue
 
             self._set_state("TRANSPORT")
-            self._move([box[0], box[1], self._lift_height], "transport")
-            self._move([box[0], box[1], self._drop_height], "lower")
+            self._move([box[0], box[1], self._tz(box[0]) + self._lift_height], "transport")
+            self._move([box[0], box[1], self._tz(box[0]) + self._drop_height], "lower")
             self._set_state("RELEASE")
             self.set_gripper(100.0)
             time.sleep(0.8)
             self._set_state("RETREAT")
-            self._move([box[0], box[1], self._lift_height], "retreat")
+            self._move([box[0], box[1], self._tz(box[0]) + self._lift_height], "retreat")
             self._observe()
             seen = self._latest("object", 1.0)
             where = "" if seen is None else f", object now seen at ({seen[0]:.2f}, {seen[1]:.2f})"

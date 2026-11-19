@@ -1,0 +1,26 @@
+image_width: 640
+image_height: 480
+camera_name: ugreen_camera:_ugreen_camera
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [519.5715 ,   0.     , 313.1149 ,
+           0.     , 514.05396, 201.23015,
+           0.     ,   0.     ,   1.     ]
+distortion_model: plumb_bob
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [0.013339, -0.076946, 0.003488, 0.001539, 0.000000]
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [1., 0., 0.,
+         0., 1., 0.,
+         0., 0., 1.]
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [515.70996,   0.     , 313.3267 ,   0.     ,
+           0.     , 513.04779, 201.61251,   0.     ,
+           0.     ,   0.     ,   1.     ,   0.     ]
