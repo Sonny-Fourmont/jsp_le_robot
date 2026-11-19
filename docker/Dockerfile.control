@@ -21,11 +21,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-jazzy-pinocchio \
     && rm -rf /var/lib/apt/lists/*
 
-# Provided packages (driver + sim) and ikpy for the IK.
+# Headless recording of RViz (tools/record_demo.py --rviz, ./run.sh video N rviz):
+# virtual X server for rviz2 + ffmpeg (screen grab and H.264 encoding of the demo videos)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    xvfb \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Provided packages (driver + sim). FK/IK use pinocchio (ros-jazzy-pinocchio, above).
 COPY core/lerobot_min /opt/so101/core
 COPY sim /opt/so101/sim
 RUN pip install --break-system-packages --no-cache-dir \
-    "numpy<2" "opencv-python-headless==4.10.*" /opt/so101/core /opt/so101/sim ikpy
+    "numpy<2" "opencv-python-headless==4.10.*" /opt/so101/core /opt/so101/sim
 
 # ROS2 workspace mounted as a volume (see docker-compose.yml)
 WORKDIR /ros2_ws

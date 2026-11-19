@@ -9,6 +9,7 @@ knows which one runs.
   - Subscribes to /joint_command (radians, gripper 0-100 %)
   - Disconnects the backend when the node stops
 """
+import math
 import threading
 import time
 from pathlib import Path
@@ -19,10 +20,12 @@ import rclpy.node
 from geometry_msgs.msg import PoseStamped, TransformStamped
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 from rclpy.executors import ExternalShutdownException
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image, JointState
 from so101_sim import SO101Sim
 from std_srvs.srv import Trigger
 from tf2_ros import StaticTransformBroadcaster
+from visualization_msgs.msg import Marker, MarkerArray
 
 JOINT_NAMES = [
     "shoulder_pan",
@@ -93,6 +96,9 @@ class DriverNode(rclpy.node.Node):
         self._cam_w: int = self.declare_parameter("camera_width", 640).value
         self._cam_h: int = self.declare_parameter("camera_height", 480).value
         self._cam_fps: float = self.declare_parameter("camera_fps", 10.0).value
+        # Software rendering (osmesa): shadows + reflections cost ~190 ms per 640x480 frame,
+        # i.e. 5-7 Hz instead of the 10 Hz announced; ~40 ms without them.
+        self._cam_shadows: bool = self.declare_parameter("camera_shadows", False).value
         # Debug/evaluation only: ground-truth object & box poses from the simulator.
         self._publish_gt: bool = self.declare_parameter("publish_ground_truth", True).value
         # Static TF world -> camera from the simulator. False: the TF comes from the camera
@@ -174,7 +180,11 @@ class DriverNode(rclpy.node.Node):
 
     def _start_sim_camera(self):
         """Publishes the MuJoCo external camera from a dedicated thread (rendering is slow)."""
-        self._pub_image = self.create_publisher(Image, f"{CAMERA_TOPIC}/image_raw", 5)
+        # Camera frames are sensor data: QoS "sensor data" = Best Effort, keep last 5. A lost
+        # frame is replaced by the next one 100 ms later, a retransmitted one arrives too late.
+        # Subscribers must be Best Effort too (a Reliable subscriber gets nothing from a
+        # Best Effort publisher). camera_info is small and must arrive: it stays Reliable.
+        self._pub_image = self.create_publisher(Image, f"{CAMERA_TOPIC}/image_raw", qos_profile_sensor_data)
         self._pub_cam_info = self.create_publisher(CameraInfo, f"{CAMERA_TOPIC}/camera_info", 5)
         import mujoco
 
@@ -183,6 +193,8 @@ class DriverNode(rclpy.node.Node):
             self._pub_gt_object = self.create_publisher(PoseStamped, "/debug/object_position_gt", 5)
             self._pub_gt_box = self.create_publisher(PoseStamped, "/debug/drop_box_position_gt", 5)
             self._pub_gt_puck = self.create_publisher(PoseStamped, "/debug/planchette_position_gt", 5)
+            # the same ground truth as RViz markers (red cube mesh, box, planchette): display only
+            self._pub_gt_markers = self.create_publisher(MarkerArray, "/debug/sim_markers", 5)
 
         # Static TF world -> camera optical frame, from the simulator (ground truth). The
         # ground truth is always published as CAMERA_FRAME_GT (to evaluate the calibration);
@@ -224,10 +236,13 @@ class DriverNode(rclpy.node.Node):
             try:
                 with self._backend_lock:  # update_scene reads the physics state (fast)
                     renderer.update_scene(self._robot.data, camera=self._robot.camera_name)
+                    renderer.scene.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = self._cam_shadows
+                    renderer.scene.flags[mujoco.mjtRndFlag.mjRND_REFLECTION] = self._cam_shadows
                     if self._publish_gt:
                         gt_obj = self._robot.get_object_position()
                         gt_box = self._robot.get_drop_box_position()
                         gt_puck = self._robot.data.body("planchette").xpos.copy() if self._has_planchette else None
+                        gt_markers = self._ground_truth_markers()
                 rgb = renderer.render()  # slow part, outside the lock
                 stamp = self.get_clock().now().to_msg()
                 msg = Image()
@@ -246,10 +261,88 @@ class DriverNode(rclpy.node.Node):
                     self._pub_gt_box.publish(self._pose_msg(gt_box, stamp))
                     if gt_puck is not None:
                         self._pub_gt_puck.publish(self._pose_msg(gt_puck, stamp))
+                    for m in gt_markers.markers:
+                        m.header.stamp = stamp
+                    self._pub_gt_markers.publish(gt_markers)
             except Exception as exc:  # noqa: BLE001
                 self.get_logger().error(f"camera: {exc}", throttle_duration_sec=5.0)
             self._camera_stop.wait(max(0.0, period - (time.monotonic() - t0)))
         renderer.close()
+
+    # Ground truth of the scene as RViz markers (simulation only). RViz knows nothing about the
+    # MuJoCo scene: without these the arm grasps "nothing" on screen. Display/evaluation only, the
+    # pipeline keeps using the perception (/object_position).
+    GT_MESHES = {  # body -> (STL in the image, scale, offset of the mesh origin in the body frame)
+        "pickup_object": ("file:///opt/so101/sim/so101_sim/assets/so101/assets/hollow_cube_rhombus_50mm.stl",
+                          0.001, (0.0, 0.0, -0.025)),
+    }
+    GT_BODIES = ("pickup_object", "drop_box", "planchette")
+
+    def _ground_truth_markers(self) -> MarkerArray:
+        import mujoco
+
+        model, data = self._robot.model, self._robot.data
+        out = MarkerArray()
+        for body in self.GT_BODIES:
+            bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body)
+            if bid < 0:
+                continue
+            R = data.xmat[bid].reshape(3, 3)
+            if body in self.GT_MESHES:
+                uri, scale, off = self.GT_MESHES[body]
+                geoms = self._body_geoms(model, bid)
+                rgba = self._geom_rgba(model, geoms[0]) if geoms else (0.9, 0.1, 0.1, 1.0)
+                m = self._marker(body, 0, Marker.MESH_RESOURCE, data.xpos[bid] + R @ off, R, (scale,) * 3, rgba)
+                m.mesh_resource = uri
+                out.markers.append(m)
+                continue
+            for k, gid in enumerate(self._body_geoms(model, bid)):
+                gtype = model.geom_type[gid]
+                size = model.geom_size[gid]
+                if gtype == mujoco.mjtGeom.mjGEOM_BOX:
+                    shape, scale = Marker.CUBE, 2.0 * size
+                elif gtype == mujoco.mjtGeom.mjGEOM_CYLINDER:
+                    shape, scale = Marker.CYLINDER, (2.0 * size[0], 2.0 * size[0], 2.0 * size[1])
+                elif gtype == mujoco.mjtGeom.mjGEOM_SPHERE:
+                    shape, scale = Marker.SPHERE, (2.0 * size[0],) * 3
+                else:
+                    continue  # meshes of other bodies: not displayed
+                out.markers.append(self._marker(body, k, shape, data.geom_xpos[gid], data.geom_xmat[gid].reshape(3, 3),
+                                                scale, self._geom_rgba(model, gid)))
+        return out
+
+    @staticmethod
+    def _body_geoms(model, bid):
+        return [g for g in range(model.ngeom) if model.geom_bodyid[g] == bid and model.geom_group[g] < 3]
+
+    @staticmethod
+    def _geom_rgba(model, gid):
+        mat = model.geom_matid[gid]
+        return model.mat_rgba[mat] if mat >= 0 else model.geom_rgba[gid]
+
+    @staticmethod
+    def _marker(ns, mid, shape, pos, R, scale, rgba) -> Marker:
+        m = Marker()
+        m.header.frame_id = "world"
+        m.ns, m.id, m.type, m.action = f"gt/{ns}", mid, shape, Marker.ADD
+        m.pose.position.x, m.pose.position.y, m.pose.position.z = map(float, pos)
+        # rotation matrix -> quaternion (w, x, y, z), MuJoCo style
+        w = math.sqrt(max(0.0, 1.0 + R[0, 0] + R[1, 1] + R[2, 2])) / 2.0
+        if w > 1e-6:
+            x, y, z = (R[2, 1] - R[1, 2]) / (4 * w), (R[0, 2] - R[2, 0]) / (4 * w), (R[1, 0] - R[0, 1]) / (4 * w)
+        else:  # 180 degree rotation: fall back to the dominant diagonal term
+            i = int(np.argmax(np.diag(R)))
+            q = np.zeros(4)
+            q[i] = math.sqrt(max(0.0, 1.0 + 2 * R[i, i] - R[0, 0] - R[1, 1] - R[2, 2])) / 2.0
+            j, k = (i + 1) % 3, (i + 2) % 3
+            q[j], q[k] = (R[j, i] + R[i, j]) / (4 * q[i]), (R[k, i] + R[i, k]) / (4 * q[i])
+            x, y, z = q
+        m.pose.orientation.w, m.pose.orientation.x, m.pose.orientation.y, m.pose.orientation.z = (
+            float(w), float(x), float(y), float(z))
+        m.scale.x, m.scale.y, m.scale.z = map(float, scale)
+        m.color.r, m.color.g, m.color.b, m.color.a = map(float, rgba)
+        m.lifetime.sec = 1
+        return m
 
     def _pose_msg(self, xyz, stamp) -> PoseStamped:
         msg = PoseStamped()
