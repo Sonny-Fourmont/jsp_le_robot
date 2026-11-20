@@ -4,6 +4,9 @@ Ce guide décrit, dans l'ordre, ce qu'il faut faire pour que le pick & place du 
 
 Toutes les commandes `docker compose` se lancent depuis le dossier `docker/`.
 
+Voir aussi `vrai_robot_jourJ.md` : la même séquence condensée, avec le lanceur `docker/run.sh`
+(`./run.sh real`, `./run.sh hsv`, `./run.sh video-reel`) et la phase 2 (planche Ouija).
+
 ## 0. Matériel nécessaire
 
 | Élément | Remarque |
@@ -13,7 +16,7 @@ Toutes les commandes `docker compose` se lancent depuis le dossier `docker/`.
 | Cube de 5 cm avec trous, **rouge** | La détection se fait par couleur (HSV). |
 | Boîte ou corbeille **brun/orange** | Plage `box_hsv_*` de `perception_node.py`. Autre couleur : ajuster les seuils. |
 | Webcam USB couleur | Autofocus désactivable. Pas de caméra monochrome. |
-| Damier imprimé, 8x6 coins intérieurs, cases de 25 mm | Pour les intrinsèques de la webcam. |
+| Damier imprimé, 8x6 coins intérieurs, cases de 25 mm | Pour les intrinsèques de la webcam. Fichier : `sim/so101_sim/assets/so101/calib/checkerboard_8x6_25mm.pdf`, à imprimer à 100 % (barre de contrôle de 10 cm). |
 | Feuille A4 avec marqueurs ArUco | Pour la pose de la caméra (étape 4). |
 | Support fixe pour la webcam | Elle ne doit plus bouger après la calibration. |
 
@@ -94,7 +97,7 @@ docker compose exec camera v4l2-ctl -c focus_automatic_continuous=0    # autofoc
 docker compose exec camera bash -lc "source /opt/ros/jazzy/setup.bash && ros2 topic hz /external_cam/image_raw"
 ```
 
-Calibration avec le damier :
+Calibration avec le damier (`sim/so101_sim/assets/so101/calib/checkerboard_8x6_25mm.pdf`, imprimé à 100 %, collé sur un support plat et rigide) :
 
 ```bash
 xhost +local:docker
