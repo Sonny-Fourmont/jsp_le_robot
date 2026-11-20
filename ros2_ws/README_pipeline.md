@@ -89,6 +89,10 @@ cd docker
 docker compose exec control bash /ros2_ws/tools/side_by_side.sh /ros2_ws/rec/tel.mp4 /ros2_ws/rec/ouija_reel.mp4 /ros2_ws/rec/rendu.mp4 [decalage]
 ```
 
+Si un enregistrement s'arrête tout de suite avec `services ... not available` (le nœud fraîchement
+lancé n'a pas découvert les services DDS dans les 20 s, ça arrive environ une fois sur dix),
+relancer la même commande : rien à réparer.
+
 `tools/record_demo.py` lance N essais aléatoires (`/sim/randomize_object` + `/pick_and_place`), vérifie
 chaque dépôt avec la vérité terrain et écrit un MP4 H.264 1280x720 à 20 i/s. La vue RViz tourne
 **dans le conteneur** sans écran : `rviz2 --fullscreen -d so101_video.rviz` sur un serveur X virtuel
@@ -229,6 +233,48 @@ l'erreur triple), `calib_file`.
 
 Sur le vrai robot, la séquence complète (intrinsèques au damier, feuille, calibration,
 vérification) est dans `docs/GUIDE_ROBOT_REEL.md`.
+
+### Phase 2 : lancer en simulation
+
+```bash
+cd docker
+./run.sh ouija                                      # scène scene_ouija.xml + ollama, RViz, shell ROS
+./run.sh video-ouija "Qui est le meilleur groupe ?" NOUS   # idem + vidéo (ros2_ws/rec/ouija_demo.mp4)
+```
+
+### Phase 2 sur le vrai robot
+
+Prérequis : le pick & place réel marche (caméra calibrée, `ros2_ws/calibration/camera_tf.json`
+à jour, caméra qui n'a pas bougé depuis), plateau imprimé et assemblé, anneau bleu fabriqué
+(voir « Impression du plateau » plus haut). Le nœud Ouija ne lit pas le plan de table de
+`workspace.yaml` : la hauteur du plateau vient de la caméra (ArUco des 4 coins), d'où
+l'importance de la calibration.
+
+1. Poser le plateau centré devant le bras, centre à ~23,5 cm de la base comme en simu, un
+   grand côté parallèle à la base. Mesurer son centre et son angle comme la feuille A4 :
+   `OUIJA_BOARD_POSE="x y yaw"` dans `.env` (ne sert qu'à calibrer la caméra sur le plateau
+   plutôt que sur la feuille ; en marche la pose vient des marqueurs). `./run.sh real`, ou
+   `docker compose up -d perception` si la pile tourne déjà. LLM : `docker compose up -d ollama`
+   (pas lancé par `./run.sh real`), première question lente, préchauffer.
+2. Plateau vu : `ros2 topic echo /ouija/board_pose --once` doit redonner le centre mesuré à
+   1 cm près. Sinon, refaire la calibration caméra avant d'aller plus loin.
+3. Anneau vu : `./run.sh hsv`, touche `3`, régler sous la vraie lumière, `s` (écrit
+   `ros2_ws/config/perception_real.yaml`), `docker compose restart perception`. Puis
+   `ros2 topic echo /ouija/pointed` donne la lettre sous l'anneau, et le panneau Perception de
+   RViz (`/ouija/debug_image`) l'entoure. Anneau posé à la main sur FIN au départ.
+4. Premier mouvement, `ARM_MAX_SPEED=0.3`, main sur l'alimentation, une seule cible :
+   `ros2 service call /ouija/spell so101_interfaces/srv/Ask "{question: OUI}"`. Regarder la
+   hauteur du doigt : la pointe doit entrer dans le trou de l'anneau (TCP 1,2 cm au-dessus du
+   plateau, pointe 6 mm plus bas). Trop haut ou trop bas : `finger_height` dans
+   `ouija_node.py` (valeur par défaut, lue au démarrage), par pas de 2 à 3 mm, puis
+   `docker compose restart control`.
+5. Ensuite un mot (`NOUS`), puis la vidéo : `./run.sh video-reel "question" NOUS` (ou `LLM`)
+   pendant que quelqu'un filme au téléphone, montage avec `tools/side_by_side.sh`.
+
+Différences avec la simu : mouvements ~3 fois plus lents à 0,3 rad/s (25 à 30 s par lettre),
+pas de vérité terrain (`/sim/reset_planchette`, `check_ouija_board.py`, `ouija_check.py` sont
+simu seulement), et la pose d'observation du Ouija n'a jamais été jouée sur le vrai bras :
+la surveiller au premier essai.
 
 ## Machine à états du brain
 
