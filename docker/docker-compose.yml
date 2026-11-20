@@ -79,6 +79,12 @@ services:
       <<: *ros-env
       CAMERA_TF: ${CAMERA_TF:-sim}
       USE_SIM: ${USE_SIM:-true}   # false: reads ros2_ws/calibration/workspace.yaml (real arm)
+      # real robot: measured sheet / board poses and tuned HSV thresholds (see .env.example);
+      # on the real arm workspace.yaml (sheet_pose) takes precedence over CALIB_SHEET_POSE
+      CALIB_MODE: ${CALIB_MODE:-calibrate}
+      CALIB_SHEET_POSE: ${CALIB_SHEET_POSE:--0.15 0.20 0.0}
+      OUIJA_BOARD_POSE: ${OUIJA_BOARD_POSE:-0.235 0.0 0.0}
+      PERCEPTION_PARAMS: ${PERCEPTION_PARAMS:-}
     volumes:
       - ../ros2_ws:/ros2_ws
       - ../sim:/opt/so101/sim:ro   # Ouija board layout (ouija_layout.json), calibration sheet (calib_sheet.json)
@@ -87,7 +93,11 @@ services:
       bash -lc "source /opt/ros/jazzy/setup.bash &&
       until [ -f /ros2_ws/install/setup.bash ] && [ -f /ros2_ws/install/so101_perception/share/so101_perception/launch/perception.launch.py ]; do echo 'waiting for build (control)...'; sleep 1; done &&
       cd /ros2_ws && source install/setup.bash &&
-      ros2 launch so101_perception perception.launch.py camera_tf:=${CAMERA_TF:-sim}"
+      ros2 launch so101_perception perception.launch.py camera_tf:=${CAMERA_TF:-sim}
+      calib_mode:=${CALIB_MODE:-calibrate}
+      sheet_pose:='${CALIB_SHEET_POSE:--0.15 0.20 0.0}'
+      board_pose:='${OUIJA_BOARD_POSE:-0.235 0.0 0.0}'
+      params_file:='${PERCEPTION_PARAMS:-none}'"
 
   # Real USB camera (UVC): publishes /external_cam/image_raw + camera_info like the sim
   # camera of the driver, so perception does not know the difference. Not started by

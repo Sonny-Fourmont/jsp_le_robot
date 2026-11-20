@@ -23,12 +23,13 @@ import math
 import os
 import threading
 import time
+from collections import deque
 
 import numpy as np
 import pinocchio as pin
 import rclpy
 import rclpy.node
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import Point, PoseStamped
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from sensor_msgs.msg import JointState
@@ -36,6 +37,7 @@ from so101_interfaces.srv import GoToTarget, MoveLine, SetJointPositions
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from pathlib import Path
+from visualization_msgs.msg import Marker, MarkerArray
 
 WORKSPACE_FILE = Path("/ros2_ws/calibration/workspace.yaml")
 
@@ -64,9 +66,12 @@ URDF_FALLBACK = "/ros2_ws/src/so101_description/urdf/so101.urdf"
 CONTROL_HZ = 50.0
 POSE_HZ = 20.0
 MAX_JOINT_SPEED = 1.0  # rad/s, applied to the fastest joint of a motion (default of `max_joint_speed`)
+GRIPPER_URDF_RANGE = (-0.174533, 1.74533)  # gripper joint in /joint_states: closed, open (rad)
+MOTION_HOLD = 0.3  # s, the final command of a trajectory is re-sent during this time
 MIN_MOTION_DURATION = 0.3  # s
 LINE_STEP = 0.01  # m, waypoint spacing of /move_line
 LINE_DEFAULT_SPEED = 0.05  # m/s
+STRAIGHT_SPEED = 0.12  # m/s, pick & place descend / lift (go_to straight=True)
 POSITION_TOLERANCE = 0.01  # m, success criterion of /go_to_target (subject: < 1 cm)
 IK_POSITION_EPS = 1e-3  # m, convergence of the solver
 IK_AXIS_EPS = 0.15  # |z_des - z_tcp| ~ 8.6 degrees
@@ -119,6 +124,10 @@ class BrainNode(rclpy.node.Node):
         self._pub_cmd = self.create_publisher(JointState, "/joint_command", 10)
         self._pub_pose = self.create_publisher(PoseStamped, "/end_effector_pose", 10)
         self._pub_target = self.create_publisher(PoseStamped, "/ik_target", 10)
+        # RViz: FK position as text + sphere, trace of the TCP, current IK target (see _publish_end_effector_pose)
+        self._pub_markers = self.create_publisher(MarkerArray, "/end_effector_markers", 5)
+        self._tcp_trace = deque()  # (time, position) of the TCP over the last TRACE_SECONDS
+        self._last_target = None  # (time, position) of the last IK target
 
         self.create_timer(1.0 / CONTROL_HZ, self._control_step, callback_group=cb_io)
         self.create_timer(1.0 / POSE_HZ, self._publish_end_effector_pose, callback_group=cb_io)
@@ -133,11 +142,19 @@ class BrainNode(rclpy.node.Node):
         pp = self.declare_parameter
         # Real arm: lower it for the first tests (ARM_MAX_SPEED in docker/.env).
         self._max_joint_speed = float(pp("max_joint_speed", MAX_JOINT_SPEED).value)
-        self._observe_joints_deg = pp("observe_joints_deg", [0.0, -80.0, 80.0, 60.0, 0.0]).value
+        # Observe / parking pose: arm raised, gripper horizontal 30 cm up and 9 cm in front of the
+        # base, out of the camera's view of the workspace. (The former folded pose had the TCP
+        # 2.7 cm above the table at r = 17 cm: it swept away cubes placed near the base.)
+        self._observe_joints_deg = pp("observe_joints_deg", [0.0, -90.0, -5.0, 90.0, 0.0]).value
+        # Real arm: table plane z(x) from calibration/workspace.yaml, all target heights are above it
         self._table_x0, self._table_z0, self._table_slope = load_table()
         if self._table_z0 or self._table_slope:
             self.get_logger().info(f"table plane z(x) = {self._table_z0:.4f} + {self._table_slope:.4f} (x - {self._table_x0:.4f})")
         self._approach_height = pp("approach_height", 0.12).value
+        # pre-grasp: highest of these where the gripper can be vertical (the descend starts there)
+        self._pregrasp_heights = (self._approach_height, 0.10, 0.08, 0.06)
+        # TCP height for the grasp: 3 cm = the fixed finger (tip 6 mm below the TCP) goes through the
+        # diamond hole of the cube's top face down to mid-height, inside the hollow cube (see grasp_offset).
         self._grasp_height = pp("grasp_height", 0.03).value
         self._lift_height = pp("lift_height", 0.15).value
         self._drop_height = pp("drop_height", 0.10).value
@@ -145,6 +162,30 @@ class BrainNode(rclpy.node.Node):
         self._max_retries = pp("max_grasp_retries", 2).value
         self._replan_distance = pp("replan_distance", 0.02).value  # m, object moved -> re-approach
         self._motion_tolerance = pp("motion_tolerance", 0.03).value  # m, accepted error of a step
+        # Closed-loop correction of go_to on the measured FK error: the real arm sags under
+        # gravity (9-15 mm measured with P=16 at 9 V), so after a motion the TCP is below /
+        # short of the target. We re-command the target shifted by the measured error, up to
+        # `goto_corrections` times, when the error exceeds `goto_correction_min_error`.
+        # In simulation the first move lands within ~1 mm, so no correction is triggered.
+        self._goto_corrections = int(pp("goto_corrections", 2).value)
+        self._goto_correction_min = float(pp("goto_correction_min_error", 0.003).value)  # m
+        self._goto_correction_gain = float(pp("goto_correction_gain", 0.8).value)  # < 1: no overshoot on a noisy measure
+        # grasp check: jaws closed below this opening (%) = nothing between them (5 cm cube ~ 35 %)
+        # Gripper opening below which the jaws closed on nothing. Hooked through the cube's holes
+        # (see grasp_offset) the jaws still close to 2-8 %, so the threshold is low; the main grasp
+        # check is the perception (object still seen where it was).
+        self._grasp_min_gripper_pct = float(pp("grasp_min_gripper_pct", 1.0).value)
+        # Where to put the TCP relative to the object centre, along the jaw axis +x_tcp (from the
+        # moving jaw towards the fixed finger). The TCP (gripper_frame_link) is the inner face of
+        # the FIXED finger, which spans x_tcp 0..+14 mm. The 5 cm hollow cube has a 38 mm diamond
+        # hole in each face: with the TCP 7 mm before the centre the finger (x_tcp 0..14) is centred
+        # in the top hole and goes down inside the cube; the moving jaw then pushes the cube until
+        # its far wall meets the finger, which pokes into that wall's side hole: the cube is hooked,
+        # it cannot slide out of the jaws (a plain pinch on the outer faces slips: the moving jaw
+        # is a lever that presses the top edge downwards). Tolerance about +-12 mm thanks to the
+        # hole's slanted rim that centres the cube under the finger.
+        # For a plain object use +(half width + 3 mm): the TCP just beyond the near face.
+        self._grasp_offset = float(pp("grasp_offset", -0.007).value)
 
         self._targets = {}  # "object" / "box" -> (xyz, monotonic time)
         self._abort = threading.Event()
@@ -185,10 +226,65 @@ class BrainNode(rclpy.node.Node):
         return self._data.oMf[self._tcp_id].copy()
 
     def _publish_end_effector_pose(self):
+        """FK of the current joint state -> /end_effector_pose (PoseStamped) + RViz markers.
+
+        The TF tree shown by RViz (robot_state_publisher, same URDF) is an independent computation
+        of the same chain: the sphere/text published here lands exactly on the gripper_frame_link
+        axes, which is the check to show (ros2 run tf2_ros tf2_echo world gripper_frame_link vs
+        ros2 topic echo /end_effector_pose)."""
         if not self._have_state:
             return
         T = self._forward_kinematics(self._current_q())
         self._pub_pose.publish(self._se3_to_msg(T))
+        self._pub_markers.publish(self._end_effector_markers(T.translation))
+
+    TRACE_SECONDS = 20.0
+
+    def _end_effector_markers(self, p) -> MarkerArray:
+        now = time.monotonic()
+        stamp = self.get_clock().now().to_msg()
+
+        def marker(ns, mid, mtype, rgba, scale):
+            m = Marker()
+            m.header.stamp, m.header.frame_id = stamp, "world"
+            m.ns, m.id, m.type, m.action = ns, mid, mtype, Marker.ADD
+            m.pose.orientation.w = 1.0
+            m.scale.x, m.scale.y, m.scale.z = scale
+            m.color.r, m.color.g, m.color.b, m.color.a = rgba
+            m.lifetime.sec = 2
+            return m
+
+        out = MarkerArray()
+        sphere = marker("tcp_fk", 0, Marker.SPHERE, (1.0, 0.85, 0.1, 0.6), (0.024, 0.024, 0.024))
+        sphere.pose.position.x, sphere.pose.position.y, sphere.pose.position.z = map(float, p)
+        out.markers.append(sphere)
+        label = marker("tcp_fk", 1, Marker.TEXT_VIEW_FACING, (1.0, 1.0, 1.0, 1.0), (0.0, 0.0, 0.016))
+        label.pose.position.x, label.pose.position.y, label.pose.position.z = float(p[0]), float(p[1]) + 0.09, float(p[2]) + 0.04
+        # no spaces: RViz (MovableText) draws them several decimetres wide
+        label.text = f"TCP=gripper_frame_link\nFK:x={p[0]:+.3f},y={p[1]:+.3f},z={p[2]:+.3f}"
+        out.markers.append(label)
+
+        # trace of the TCP: a point every 2 mm of travel, kept TRACE_SECONDS
+        if not self._tcp_trace or np.linalg.norm(self._tcp_trace[-1][1] - p) > 0.002:
+            self._tcp_trace.append((now, np.asarray(p, dtype=float).copy()))
+        while self._tcp_trace and now - self._tcp_trace[0][0] > self.TRACE_SECONDS:
+            self._tcp_trace.popleft()
+        trace = marker("tcp_trace", 2, Marker.LINE_STRIP, (0.2, 0.9, 1.0, 0.9), (0.003, 0.0, 0.0))
+        if len(self._tcp_trace) >= 2:
+            trace.points = [Point(x=float(q[0]), y=float(q[1]), z=float(q[2])) for _, q in self._tcp_trace]
+        else:
+            trace.action = Marker.DELETE
+        out.markers.append(trace)
+
+        # last IK target (where the brain asked the TCP to go), magenta, 5 s after the request
+        target = marker("ik_target", 3, Marker.SPHERE, (1.0, 0.2, 0.9, 0.8), (0.016, 0.016, 0.016))
+        if self._last_target is not None and now - self._last_target[0] < 5.0:
+            t = self._last_target[1]
+            target.pose.position.x, target.pose.position.y, target.pose.position.z = map(float, t)
+        else:
+            target.action = Marker.DELETE
+        out.markers.append(target)
+        return out
 
     def _se3_to_msg(self, T: pin.SE3) -> PoseStamped:
         msg = PoseStamped()
@@ -200,25 +296,75 @@ class BrainNode(rclpy.node.Node):
         msg.pose.orientation.z, msg.pose.orientation.w = float(qz), float(qw)
         return msg
 
-    def _solve_ik(self, target_position, approach_dir=(0.0, 0.0, -1.0), q_seed=None, x_dir=None):
+    def _solve_ik(self, target_position, approach_dir=(0.0, 0.0, -1.0), q_seed=None, x_dir=None, local=False,
+                  symmetric=True):
         """Damped least squares IK on the 5 arm joints.
 
         Tasks: TCP position (3) + TCP z axis aligned with approach_dir (2 effective).
         x_dir (optional, default world x): desired direction of the TCP x axis (the jaw axis),
         obtained afterwards with the wrist roll, which is free when the gripper points down.
+        local: solve from q_seed only (no multi-start), to stay in the same arm configuration
+        when re-targeting a few millimetres away (go_to corrections).
+        symmetric: x_dir and -x_dir are equivalent (default); False keeps the sign, needed when the
+        side of the moving jaw matters (grasp).
         Returns (q_arm, pos_error_m, axis_error) for the best solution found.
         """
-        q_arm, pos_err, axis_err = self._solve_ik_position_axis(target_position, approach_dir, q_seed)
+        q_arm, pos_err, axis_err = self._solve_ik_position_axis(target_position, approach_dir, q_seed, local)
         if x_dir is None:
             x_dir = (1.0, 0.0, 0.0)  # default: jaws along the robot x axis (roll near 0, never left random)
         if q_arm is not None:
-            q_arm = self._align_roll(q_arm, x_dir)
+            p_des = np.asarray(target_position, dtype=float)
+            z_des = np.asarray(approach_dir, dtype=float)
+            z_des = z_des / np.linalg.norm(z_des)
+            # The TCP is 7.9 mm off the roll axis (gripper_frame_joint), so turning the roll moves
+            # it by up to 8 mm: align the roll, then re-polish the position with the roll locked.
+            # Twice, because the polish turns the TCP x axis a little.
+            for _ in range(2):
+                q_arm = self._align_roll(q_arm, x_dir, symmetric)
+                q_arm, pos_err, axis_err = self._polish_position(q_arm, p_des, z_des)
         return q_arm, pos_err, axis_err
 
-    def _align_roll(self, q_arm, x_dir):
+    def _polish_position(self, q_arm, p_des, z_des, axis_weight=0.05):
+        """Re-solves position + approach axis on the first 4 joints (wrist roll locked), then
+        polishes the position only, like _solve_ik_position_axis. Keeping the axis task here
+        matters: a position-only solve would tilt the gripper to absorb the roll offset.
+        Returns (q_arm, pos_error_m, axis_error) measured on the result."""
+        q = np.concatenate([q_arm, [0.0]])
+        for _ in range(100):
+            T = self._forward_kinematics(q)
+            z = T.rotation[:, 2]
+            e_p = p_des - T.translation
+            e_z = z_des - z
+            if np.linalg.norm(e_p) < 1e-4 and np.linalg.norm(e_z) < IK_AXIS_EPS:
+                break
+            J = pin.computeFrameJacobian(self._model, self._data, q, self._tcp_id, pin.LOCAL_WORLD_ALIGNED)
+            Je = np.vstack([J[:3, :4], axis_weight * (-pin.skew(z) @ J[3:, :4])])
+            e = np.concatenate([e_p, axis_weight * e_z])
+            dq = Je.T @ np.linalg.solve(Je @ Je.T + 1e-4 * np.eye(6), e)
+            step = np.linalg.norm(dq)
+            if step > 0.3:
+                dq *= 0.3 / step
+            q[:4] = np.clip(q[:4] + dq, self._q_lo[:4], self._q_hi[:4])
+        for _ in range(50):
+            T = self._forward_kinematics(q)
+            e_p = p_des - T.translation
+            if np.linalg.norm(e_p) < 1e-4:
+                break
+            Jp = pin.computeFrameJacobian(
+                self._model, self._data, q, self._tcp_id, pin.LOCAL_WORLD_ALIGNED
+            )[:3, :4]
+            dq = Jp.T @ np.linalg.solve(Jp @ Jp.T + 1e-6 * np.eye(3), e_p)
+            q[:4] = np.clip(q[:4] + dq, self._q_lo[:4], self._q_hi[:4])
+        T = self._forward_kinematics(q)
+        pos_err = float(np.linalg.norm(p_des - T.translation))
+        axis_err = float(np.linalg.norm(z_des - T.rotation[:, 2]))
+        return q[:5].copy(), pos_err, axis_err
+
+    def _align_roll(self, q_arm, x_dir, symmetric=True):
         """Turns the wrist roll so that the TCP x axis (jaw axis) points along x_dir
-        (projected on the plane perpendicular to the TCP z axis). The jaws are symmetric,
-        so an angle differing by 180 degrees is equivalent: the smaller rotation is used."""
+        (projected on the plane perpendicular to the TCP z axis). symmetric: an angle differing
+        by 180 degrees is equivalent, the smaller rotation is used (jaw axis only); otherwise the
+        sign is kept (the moving jaw is on the -x_tcp side)."""
         x_des = np.asarray(x_dir, dtype=float)
         q = np.concatenate([q_arm, [0.0]])
 
@@ -230,19 +376,38 @@ class BrainNode(rclpy.node.Node):
                 return 0.0
             xd /= np.linalg.norm(xd)
             e = math.atan2(np.dot(np.cross(x, xd), z), np.dot(x, xd))
-            return (e + math.pi / 2) % math.pi - math.pi / 2  # symmetric jaws
+            if symmetric:
+                return (e + math.pi / 2) % math.pi - math.pi / 2  # jaw axis only
+            return (e + math.pi) % (2 * math.pi) - math.pi
 
-        e0 = error(q)
-        q[4] = np.clip(q[4] + e0, self._q_lo[4], self._q_hi[4])
-        if abs(error(q)) > abs(e0) * 0.5 + 1e-3:  # roll axis had the other sign
-            q[4] = np.clip(q_arm[4] - e0, self._q_lo[4], self._q_hi[4])
+        # The roll axis may be +z or -z of the TCP (try both signs), and the roll has limits: when
+        # the nearest alignment is clipped, the one 180 deg away (same jaw axis) usually fits. Keep
+        # the candidate with the smallest residual, then the smallest roll change.
+        lo, hi = self._q_lo[4], self._q_hi[4]
+        for _ in range(3):
+            e = error(q)
+            if abs(e) < 1e-3:
+                break
+            q4 = q[4]
+            turns = (0.0, math.pi, -math.pi) if symmetric else (0.0,)
+            # residuals within 1 deg count as equal: then the smallest roll change wins (otherwise a
+            # 180 deg turn can win on a 0.01 deg difference and flip the side of the moving jaw)
+            best = (round(abs(e) / 0.017), 0.0, q4)
+            for sign in (1.0, -1.0):
+                for turn in turns:
+                    cand = float(np.clip(q4 + sign * e + turn, lo, hi))
+                    q[4] = cand
+                    best = min(best, (round(abs(error(q)) / 0.017), abs(cand - q4), cand))
+            q[4] = best[2]
         return q[:5].copy()
 
-    def _solve_ik_position_axis(self, target_position, approach_dir, q_seed):
+    def _solve_ik_position_axis(self, target_position, approach_dir, q_seed, local=False):
         p_des = np.asarray(target_position, dtype=float)
         z_des = np.asarray(approach_dir, dtype=float)
         z_des = z_des / np.linalg.norm(z_des)
         q_now = self._current_q() if q_seed is None else np.asarray(q_seed, dtype=float)
+        if q_now.shape[0] == 5:  # arm joints only: add the gripper (not part of the TCP chain)
+            q_now = np.concatenate([q_now, [0.0]])
 
         pan = math.atan2(p_des[1], p_des[0])
         seeds = [
@@ -256,6 +421,9 @@ class BrainNode(rclpy.node.Node):
             s = rng.uniform(self._q_lo, self._q_hi)
             s[0] = pan
             seeds.append(s)
+        if local:
+            seeds = seeds[:1]  # current configuration only
+        nj = 4 if local else 5  # local: wrist roll locked too (same jaw axis, same side of the moving jaw)
 
         best = (None, np.inf, np.inf)
         q = q_now.copy()
@@ -272,8 +440,8 @@ class BrainNode(rclpy.node.Node):
                     J = pin.computeFrameJacobian(
                         self._model, self._data, q, self._tcp_id, pin.LOCAL_WORLD_ALIGNED
                     )
-                    Jp = J[:3, :5]
-                    Jz = -pin.skew(z) @ J[3:, :5]
+                    Jp = J[:3, :nj]
+                    Jz = -pin.skew(z) @ J[3:, :nj]
                     Je = np.vstack([Jp, axis_weight * Jz])
                     e = np.concatenate([e_p, axis_weight * e_z])
                     lam = 1e-4
@@ -281,7 +449,7 @@ class BrainNode(rclpy.node.Node):
                     step = np.linalg.norm(dq)
                     if step > 0.3:
                         dq *= 0.3 / step
-                    q[:5] = np.clip(q[:5] + dq, self._q_lo, self._q_hi)
+                    q[:nj] = np.clip(q[:nj] + dq, self._q_lo[:nj], self._q_hi[:nj])
                 # Polish: position only (orientation is only a preference on a 5-DoF arm).
                 for _ in range(50):
                     T = self._forward_kinematics(q)
@@ -290,9 +458,9 @@ class BrainNode(rclpy.node.Node):
                         break
                     Jp = pin.computeFrameJacobian(
                         self._model, self._data, q, self._tcp_id, pin.LOCAL_WORLD_ALIGNED
-                    )[:3, :5]
+                    )[:3, :nj]
                     dq = Jp.T @ np.linalg.solve(Jp @ Jp.T + 1e-6 * np.eye(3), e_p)
-                    q[:5] = np.clip(q[:5] + dq, self._q_lo, self._q_hi)
+                    q[:nj] = np.clip(q[:nj] + dq, self._q_lo[:nj], self._q_hi[:nj])
                 T = self._forward_kinematics(q)
                 pos_err = float(np.linalg.norm(p_des - T.translation))
                 axis_err = float(np.linalg.norm(z_des - T.rotation[:, 2]))
@@ -342,8 +510,32 @@ class BrainNode(rclpy.node.Node):
         t_end = time.monotonic() + timeout
         while self._motion_active() and time.monotonic() < t_end:
             time.sleep(0.02)
-        time.sleep(0.3)  # let the arm settle on the last command
         return not self._motion_active()
+
+    def _jaw_axis(self, q_arm):
+        """Jaw axis (+x of the TCP frame) of a configuration, projected on the table, unit, world."""
+        x = self._forward_kinematics(np.concatenate([q_arm, [0.0]])).rotation[:, 0]
+        x = np.array([x[0], x[1], 0.0])
+        n = np.linalg.norm(x)
+        return x / n if n > 1e-6 else np.array([1.0, 0.0, 0.0])
+
+    def _gripper_pct(self) -> float:
+        """Measured gripper opening in % (0 closed, 100 open), from /joint_states (URDF rad)."""
+        lo, hi = GRIPPER_URDF_RANGE
+        return float(np.clip((self._current_q()[5] - lo) / (hi - lo), 0.0, 1.0) * 100.0)
+
+    def _wait_settled(self, timeout=1.0, eps=0.003):
+        """Waits until the measured joints stop moving (|dq| < eps rad over 0.1 s, eps above the
+        0.0015 rad tick of the real servos), timeout max."""
+        t_end = time.monotonic() + timeout
+        q0 = self._current_q()[:5]
+        while time.monotonic() < t_end:
+            time.sleep(0.1)
+            q1 = self._current_q()[:5]
+            if float(np.max(np.abs(q1 - q0))) < eps:
+                return True
+            q0 = q1
+        return False
 
     def _control_step(self):
         with self._lock:
@@ -351,9 +543,14 @@ class BrainNode(rclpy.node.Node):
                 return
             t = time.monotonic() - self._traj_t0
             points = self._traj_points
-            if t >= points[-1][0]:
+            if t >= points[-1][0] + MOTION_HOLD:
                 q_cmd = points[-1][1]
                 self._traj_points = None
+            elif t >= points[-1][0]:
+                # Hold: the final command is re-sent for MOTION_HOLD s. The driver caps every
+                # command to max_step from the measured position (log "capped"), so a command that
+                # was sent only once after a timer hiccup would leave the arm short of the target.
+                q_cmd = points[-1][1]
             else:
                 i = 1
                 while points[i][0] < t:
@@ -381,31 +578,115 @@ class BrainNode(rclpy.node.Node):
         msg.position = [float(np.clip(pct, 0.0, 100.0))]
         self._pub_cmd.publish(msg)
 
-    def go_to(self, position, approach_dir=(0.0, 0.0, -1.0), tolerance=POSITION_TOLERANCE, x_dir=None):
+    def go_to(self, position, approach_dir=(0.0, 0.0, -1.0), tolerance=POSITION_TOLERANCE, x_dir=None,
+              correct=True, local=False, jaw_offset=0.0, straight=False):
         """Blocking move of the TCP to a world position. Returns (ok, message).
+
+        correct: closed-loop corrections on the measured FK error (goto_corrections), for the
+        steps where millimetres matter (grasp, /go_to_target); off for the coarse transit steps.
+        local: solve the IK from the current configuration only (same posture and wrist roll as
+        now), with the multi-start solve as fallback; used for the short pick & place steps.
+        jaw_offset: `position` is the centre of an object to take between the jaws: the TCP
+        (inner face of the fixed jaw) is placed jaw_offset beyond it along the jaw axis +x_tcp.
+        straight: Cartesian straight line (waypoints every LINE_STEP, same jaw axis) instead of
+        one joint-space segment, whose curved TCP path can clip an object a few mm away.
 
         tolerance: accepted error between the target and the measured TCP (m). The
         simulated/real arm sags a little at full extension, so the pick & place steps
         use a looser value than the /go_to_target service.
         """
-        q_arm, pos_err, axis_err = self._solve_ik(position, approach_dir, x_dir=x_dir)
+        target = np.asarray(position, dtype=float)
+        symmetric = True
+        if local:
+            # keep the jaw axis AND its sign (the side of the moving jaw) of the current posture
+            if x_dir is None:
+                x_dir = self._jaw_axis(self._current_q()[:5])
+            symmetric = False
+        q_arm, pos_err, axis_err = self._solve_ik(target, approach_dir, x_dir=x_dir, local=local, symmetric=symmetric)
+        if local and (q_arm is None or pos_err > POSITION_TOLERANCE):  # multi-start fallback
+            q_arm, pos_err, axis_err = self._solve_ik(target, approach_dir, x_dir=x_dir, symmetric=symmetric)
         if q_arm is None or pos_err > POSITION_TOLERANCE:
             return False, f"IK failed: closest reachable point is {pos_err * 1000:.1f} mm away"
+        if jaw_offset:
+            # Shift the TCP along the jaw axis of the solution found, re-solving from that solution
+            # (same wrist roll, so the jaw axis keeps its direction and the moving jaw its side).
+            for _ in range(2):
+                jaw = self._jaw_axis(q_arm)
+                shifted = target + jaw_offset * jaw
+                q2, pos_err2, axis_err2 = self._solve_ik(shifted, approach_dir, q_seed=q_arm, x_dir=jaw, local=True,
+                                                        symmetric=False)
+                if q2 is None or pos_err2 > POSITION_TOLERANCE:  # local solve stuck: multi-start
+                    q2, pos_err2, axis_err2 = self._solve_ik(shifted, approach_dir, x_dir=jaw, symmetric=False)
+                if q2 is None or pos_err2 > POSITION_TOLERANCE:
+                    return False, f"IK failed: grasp point {pos_err2 * 1000:.1f} mm out of reach"
+                q_arm, pos_err, axis_err = q2, pos_err2, axis_err2
+                if np.dot(self._jaw_axis(q_arm), jaw) > 0.9:
+                    break
+            self.get_logger().info(
+                f"jaw offset {jaw_offset * 1000:.0f} mm along ({jaw[0]:+.2f}, {jaw[1]:+.2f}): "
+                f"object ({target[0]:.3f}, {target[1]:.3f}) -> TCP ({shifted[0]:.3f}, {shifted[1]:.3f})")
+            target = shifted
         tgt = PoseStamped()
         tgt.header.stamp = self.get_clock().now().to_msg()
         tgt.header.frame_id = "world"
-        tgt.pose.position.x, tgt.pose.position.y, tgt.pose.position.z = map(float, position)
+        tgt.pose.position.x, tgt.pose.position.y, tgt.pose.position.z = map(float, target)
         tgt.pose.orientation.w = 1.0
         self._pub_target.publish(tgt)
+        self._last_target = (time.monotonic(), np.asarray(target, dtype=float).copy())
 
-        self._start_motion(q_arm)
-        if not self._wait_motion():
-            return False, "motion timeout"
-        T = self._forward_kinematics(self._current_q())
-        err = float(np.linalg.norm(T.translation - np.asarray(position)))
+        commanded = target.copy()  # what we ask the IK for; drifts away from `target` by the measured sag
+        corrections = 0
+        best = None  # (error, q_arm) of the best command so far
+        path = self._straight_path(target, q_arm, approach_dir) if straight else None
+        while True:
+            if path:
+                self._start_trajectory(path, min_segment_duration=LINE_STEP / STRAIGHT_SPEED)
+                path = None
+            else:
+                self._start_motion(q_arm)
+            if not self._wait_motion():
+                return False, "motion timeout"
+            if correct:
+                self._wait_settled()
+            T = self._forward_kinematics(self._current_q())
+            err_vec = target - T.translation
+            err = float(np.linalg.norm(err_vec))
+            if best is not None and err > best[0] + 1e-3:
+                # Worse than before (noisy measure, contact...): back to the best command, stop.
+                self.get_logger().warning(
+                    f"go_to correction {corrections}: error {err * 1000:.1f} mm, worse than "
+                    f"{best[0] * 1000:.1f} mm before: reverting to the previous command")
+                q_arm = best[1]
+                self._start_motion(q_arm)
+                self._wait_motion()
+                self._wait_settled()
+                T = self._forward_kinematics(self._current_q())
+                err_vec = target - T.translation
+                err = float(np.linalg.norm(err_vec))
+                break
+            best = (err, q_arm)
+            if not correct or err <= self._goto_correction_min or corrections >= self._goto_corrections:
+                break
+            # Retarget by the measured error (the arm lands at commanded - sag, so ask for target + sag),
+            # solving the IK from the current configuration only (same posture, same sag).
+            shift = self._goto_correction_gain * err_vec
+            commanded = commanded + shift
+            q_new, pos_err2, axis_err2 = self._solve_ik(commanded, approach_dir, q_seed=self._current_q(),
+                                                        x_dir=x_dir, local=True, symmetric=symmetric)
+            if q_new is None or pos_err2 > POSITION_TOLERANCE:
+                self.get_logger().warning(
+                    f"go_to correction {corrections + 1}: error {err * 1000:.1f} mm but the shifted "
+                    f"target is out of reach ({pos_err2 * 1000:.1f} mm away), keeping the current pose")
+                break
+            corrections += 1
+            self.get_logger().info(
+                f"go_to correction {corrections}: measured error {err * 1000:.1f} mm, retarget by "
+                f"({shift[0] * 1000:+.1f}, {shift[1] * 1000:+.1f}, {shift[2] * 1000:+.1f}) mm")
+            q_arm, axis_err = q_new, axis_err2
         ok = err <= tolerance
         return ok, (
-            f"reached, error {err * 1000:.1f} mm (IK residual {pos_err * 1000:.1f} mm, "
+            f"reached, error {err * 1000:.1f} mm after {corrections} correction(s) "
+            f"(IK residual {pos_err * 1000:.1f} mm, "
             f"approach axis error {math.degrees(2 * math.asin(min(1.0, axis_err / 2))):.1f} deg)"
         )
 
@@ -521,9 +802,35 @@ class BrainNode(rclpy.node.Node):
         if self._abort.is_set():
             raise RuntimeError("aborted by /brain/stop")
 
-    def _move(self, position, what):
+    def _straight_path(self, target, q_end, approach_dir):
+        """Joint waypoints along the straight TCP line from the current position to `target`,
+        ending exactly at q_end; same jaw axis and side as q_end all along. None if the line
+        cannot be solved (the caller then moves in joint space)."""
+        q_now = self._current_q()
+        p0 = self._forward_kinematics(q_now).translation
+        p1 = np.asarray(target, dtype=float)
+        dist = float(np.linalg.norm(p1 - p0))
+        n = int(math.ceil(dist / LINE_STEP))
+        if n < 2:
+            return None
+        jaw = self._jaw_axis(q_end)
+        waypoints, q_seed = [], q_now
+        for i in range(1, n):
+            p = p0 + (p1 - p0) * i / n
+            q_arm, pos_err, _ = self._solve_ik(p, approach_dir, q_seed=q_seed, x_dir=jaw, local=True,
+                                               symmetric=False)
+            if q_arm is None or pos_err > POSITION_TOLERANCE:
+                self.get_logger().warning(f"straight path: waypoint {i}/{n} unreachable, moving in joint space")
+                return None
+            waypoints.append(q_arm)
+            q_seed = np.concatenate([q_arm, q_seed[5:]])
+        waypoints.append(np.asarray(q_end, dtype=float))
+        return waypoints
+
+    def _move(self, position, what, correct=False, local=False, jaw_offset=0.0, straight=False):
         self._check_abort()
-        ok, msg = self.go_to(position, tolerance=self._motion_tolerance)
+        ok, msg = self.go_to(position, tolerance=self._motion_tolerance, correct=correct, local=local,
+                             jaw_offset=jaw_offset, straight=straight)
         if not ok:
             raise RuntimeError(f"{what}: {msg}")
 
@@ -533,12 +840,24 @@ class BrainNode(rclpy.node.Node):
         self.set_gripper(100.0)
         self._start_motion(np.radians(self._observe_joints_deg))
         self._wait_motion()
+        # Wait for a *stable* detection: while the arm leaves the camera view it can hide part of
+        # the cube, and the centroid of a half-hidden cube is off by 1-2 cm (seen in simulation:
+        # the gripper then lands on the cube and pushes it away). 3 consecutive samples within 5 mm.
         t_end = time.monotonic() + 3.0
+        hist, last_stamp = [], None
         while time.monotonic() < t_end:
             self._check_abort()
-            if self._latest("object", 0.5) is not None and self._latest("box", 0.5) is not None:
-                return
-            time.sleep(0.1)
+            with self._lock:
+                entry = self._targets.get("object")
+            if entry is not None and time.monotonic() - entry[1] < 0.5 and self._latest("box", 0.5) is not None:
+                if entry[1] != last_stamp:  # a new sample (perception at 10 Hz)
+                    hist.append(entry[0].copy())
+                    last_stamp = entry[1]
+                if len(hist) >= 3 and max(np.linalg.norm((h - hist[-1])[:2]) for h in hist[-3:]) < 0.005:
+                    return
+            time.sleep(0.05)
+        if hist:
+            self.get_logger().warn("object detection still moving after 3 s, using the last one")
 
     def _tz(self, x) -> float:
         """Height of the table at abscissa x (0 in simulation); target heights are above the table.
@@ -566,7 +885,22 @@ class BrainNode(rclpy.node.Node):
             # APPROACH above the object, re-plan while it keeps moving.
             self._set_state("APPROACH")
             for _ in range(4):
-                self._move([obj[0], obj[1], self._tz(obj[0]) + self._approach_height], "approach")
+                # Transit at approach_height (the gripper may be tilted there: at 12 cm the wrist
+                # cannot point straight down), then a straight move to the pre-grasp pose with a
+                # vertical gripper, so that the descend is a pure vertical translation and the
+                # fixed finger enters the object's hole instead of landing on it.
+                # All heights are above the table plane (self._tz, 0 in simulation).
+                tz = self._tz(obj[0])
+                self._move([obj[0], obj[1], tz + self._approach_height], "approach", jaw_offset=self._grasp_offset)
+                for z in self._pregrasp_heights:
+                    q_try, err_try, axis_try = self._solve_ik([obj[0], obj[1], tz + z])
+                    if q_try is not None and err_try <= POSITION_TOLERANCE and axis_try < IK_AXIS_EPS:
+                        if z < self._approach_height:
+                            self._move([obj[0], obj[1], tz + z], "pre-grasp", local=True, straight=True,
+                                       jaw_offset=self._grasp_offset)
+                        break
+                else:
+                    self.get_logger().warn("no height with a vertical gripper above the object, descending tilted")
                 fresh = self._latest("object", self._max_target_age)
                 if fresh is None or np.linalg.norm((fresh - obj)[:2]) < self._replan_distance:
                     break
@@ -574,31 +908,60 @@ class BrainNode(rclpy.node.Node):
                 obj = fresh
 
             self._set_state("DESCEND")
-            self._move([obj[0], obj[1], self._tz(obj[0]) + self._grasp_height], "descend")
+            # local: same posture and roll as the approach, so the TCP goes straight down
+            tz = self._tz(obj[0])
+            try:
+                self._move([obj[0], obj[1], tz + self._grasp_height], "descend", correct=True, local=True,
+                           straight=True, jaw_offset=self._grasp_offset)  # the grasp needs the mm
+            except RuntimeError as exc:
+                if "reached, error" not in str(exc) or attempt >= self._max_retries:
+                    raise
+                # Blocked well above the target: the fixed finger landed on the object instead of in
+                # its hole (perception off, or tilted gripper near the base). Back up and retry.
+                self.get_logger().warn(f"descend blocked ({exc}), attempt {attempt + 1}: backing up to retry")
+                self._move([obj[0], obj[1], tz + self._lift_height], "back up", local=True,
+                           jaw_offset=self._grasp_offset, straight=True)
+                self._observe()
+                fresh = self._latest("object", self._max_target_age)
+                if fresh is not None:
+                    obj = fresh
+                continue
             self._set_state("GRASP")
             self.set_gripper(0.0)
             time.sleep(0.8)
             self._set_state("LIFT")
-            self._move([obj[0], obj[1], self._tz(obj[0]) + self._lift_height], "lift")
+            self._move([obj[0], obj[1], tz + self._lift_height], "lift", local=True, jaw_offset=self._grasp_offset,
+                       straight=True)
             time.sleep(0.5)
 
-            # Grasp check: if the object is still seen where it was, we missed it.
+            # Grasp check: jaws fully closed = nothing between them; object still seen where it
+            # was = we missed it (or pushed it: the fresh position is reused for the retry).
             still_there = self._latest("object", 0.5)
-            if still_there is not None and np.linalg.norm((still_there - obj)[:2]) < 0.03:
-                self.get_logger().warn(f"grasp failed (object still on the table), attempt {attempt + 1}")
+            missed = still_there is not None and np.linalg.norm((still_there - obj)[:2]) < 0.03
+            if self._gripper_pct() < self._grasp_min_gripper_pct or missed:
+                why = "jaws closed on nothing" if not missed else "object still on the table"
+                self.get_logger().warn(
+                    f"grasp failed ({why}, gripper {self._gripper_pct():.0f} %), attempt {attempt + 1}")
                 self.set_gripper(100.0)
                 time.sleep(0.5)
-                obj = still_there
+                if still_there is not None:
+                    obj = still_there
+                self._observe()  # fresh, stable detection for the retry
+                fresh = self._latest("object", self._max_target_age)
+                if fresh is not None:
+                    obj = fresh
                 continue
 
             self._set_state("TRANSPORT")
-            self._move([box[0], box[1], self._tz(box[0]) + self._lift_height], "transport")
-            self._move([box[0], box[1], self._tz(box[0]) + self._drop_height], "lower")
+            # same jaw offset over the box, so that the object (not the TCP) ends at its centre
+            tzb = self._tz(box[0])
+            self._move([box[0], box[1], tzb + self._lift_height], "transport", local=True, jaw_offset=self._grasp_offset)
+            self._move([box[0], box[1], tzb + self._drop_height], "lower", local=True, jaw_offset=self._grasp_offset)
             self._set_state("RELEASE")
             self.set_gripper(100.0)
             time.sleep(0.8)
             self._set_state("RETREAT")
-            self._move([box[0], box[1], self._tz(box[0]) + self._lift_height], "retreat")
+            self._move([box[0], box[1], tzb + self._lift_height], "retreat", local=True, jaw_offset=self._grasp_offset)
             self._observe()
             seen = self._latest("object", 1.0)
             where = "" if seen is None else f", object now seen at ({seen[0]:.2f}, {seen[1]:.2f})"

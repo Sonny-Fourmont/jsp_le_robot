@@ -16,6 +16,7 @@ import rclpy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 
@@ -60,7 +61,7 @@ def main():
     node.create_subscription(PoseStamped, "/debug/planchette_position_gt", lambda m: latest.update(gt=m), 5)
     node.create_subscription(PoseStamped, "/ouija/board_pose", lambda m: latest.update(board=m), 5)
     node.create_subscription(String, "/ouija/pointed", lambda m: latest.update(pointed=m), 5)
-    node.create_subscription(Image, "/external_cam/image_raw", lambda m: latest.update(img=m), 2)
+    node.create_subscription(Image, "/external_cam/image_raw", lambda m: latest.update(img=m), qos_profile_sensor_data)
     cli_j = node.create_client(SetJointPositions, "/set_joint_positions")
     cli_g = node.create_client(GoToTarget, "/go_to_target")
     cli_j.wait_for_service(); cli_g.wait_for_service()

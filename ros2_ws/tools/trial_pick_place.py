@@ -29,11 +29,22 @@ def main():
     randomize.wait_for_service(10)
     pick.wait_for_service(10)
 
-    def call(client):
-        fut = client.call_async(Trigger.Request())
-        while not fut.done():
-            rclpy.spin_once(node, timeout_sec=0.05)
-        return fut.result()
+    def call(client, timeout=120.0, resend_after=10.0):
+        """Service call that survives a request lost at (re)connection: re-sent if no
+        answer after `resend_after` s (a pick & place answers in ~20 s, a randomize at once)."""
+        t_start = time.time()
+        while True:
+            fut = client.call_async(Trigger.Request())
+            t_sent = time.time()
+            while not fut.done():
+                rclpy.spin_once(node, timeout_sec=0.05)
+                if client.srv_name.endswith("randomize_object") and time.time() - t_sent > resend_after:
+                    print(f"  no answer from {client.srv_name} after {resend_after:.0f} s, re-sending")
+                    break
+                if time.time() - t_start > timeout:
+                    raise RuntimeError(f"{client.srv_name}: no answer after {timeout:.0f} s")
+            if fut.done():
+                return fut.result()
 
     def spin(seconds):
         end = time.time() + seconds

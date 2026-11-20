@@ -25,7 +25,7 @@ MARKER_INSET = 0.012
 # Planchette = ring (see scene_ouija.xml): outer radius, hole radius, height (m)
 PLANCHETTE_RADIUS, PLANCHETTE_HOLE_RADIUS, PLANCHETTE_HEIGHT = 0.021, 0.011, 0.015
 
-# Reach of the TCP pointing down (measured with tools/reach_test.py): 0.13 m .. 0.34 m from
+# Reach of the TCP pointing down (measured in October 2026 with the brain's IK): 0.13 m .. 0.34 m from
 # the base. The targets stay within 0.18 .. 0.30 m.
 ARCS = [  # (labels, radius from robot base, angle start, angle end) in degrees, +angle = +y (left)
     (list("ABCDEFGHIJKLM"), 0.295, 45, -45),
