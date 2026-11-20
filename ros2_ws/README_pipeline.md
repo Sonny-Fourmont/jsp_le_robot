@@ -79,8 +79,14 @@ Téléopération clavier : `python3 /ros2_ws/teleop_keyboard.py`.
 cd docker
 ./run.sh video 3 main   # vue 3D MuJoCo plein cadre      -> ros2_ws/rec/pick_place_sim_main.mp4
 ./run.sh video 3 rviz   # vue RViz (TF + FK du TCP)      -> ros2_ws/rec/pick_place_rviz.mp4
+./run.sh video 3 grid   # 2x2 : MuJoCo, RViz (TF + FK), caméra, détection, 1920x1080 -> ros2_ws/rec/pick_place_grid.mp4
+                        # (vidéo de rendu : les trois vues exigées dans un seul cadre)
 ./run.sh video 3        # 3 panneaux (3D, caméra, perception) -> ros2_ws/rec/pick_place_sim.mp4
 ./run.sh video-ouija "Qui est le meilleur groupe ?" NOUS   # phase 2 -> ros2_ws/rec/ouija_demo.mp4
+./run.sh video-reel "Qui est le meilleur groupe ?" NOUS    # phase 2 sur le VRAI robot -> ros2_ws/rec/ouija_reel.mp4
+./run.sh video-reel "Es-tu vivant ?" LLM                   # idem, la question passe par le LLM (ollama)
+# clip téléphone de la scène à côté de l'enregistrement (son du téléphone gardé, décalage en s optionnel) :
+docker compose exec control bash /ros2_ws/tools/side_by_side.sh /ros2_ws/rec/tel.mp4 /ros2_ws/rec/ouija_reel.mp4 /ros2_ws/rec/rendu.mp4 [decalage]
 ```
 
 `tools/record_demo.py` lance N essais aléatoires (`/sim/randomize_object` + `/pick_and_place`), vérifie
@@ -278,9 +284,25 @@ fois au plus. Si l'erreur empire, il revient à la meilleure commande. Actif pou
 ## Bras réel
 
 `.env` : `USE_SIM=false`, `REAL_ROBOT_PORT` (`ls /dev/ttyACM*`, adaptateur série QinHeng
-CH343), `CALIBRATION_FILE` (fichier `lerobot-calibrate` du 9 octobre, aussi copié dans
-`calibration/`), puis `docker compose up -d control viz`. Le driver refuse de démarrer si
-la calibration du fichier ne correspond pas à celle écrite dans les moteurs.
+CH343), `CALIBRATION_FILE` (un des fichiers de `calibration/`, celui qui correspond à ce qui
+est écrit dans les moteurs : `tools/read_motor_calibration.py` le vérifie), puis
+`docker compose up -d control viz`. Le driver refuse de démarrer si la calibration du
+fichier ne correspond pas à celle écrite dans les moteurs.
+
+Outils du bras réel (`ros2_ws/tools/`, détails dans `docs/GUIDE_ROBOT_REEL.md`) :
+- `read_motor_calibration.py` : lit la calibration stockée dans les moteurs (lecture seule), la
+  compare au fichier du driver et la sauve dans `ros2_ws/calibration/` ;
+- `write_motor_calibration.py` : réécrit le fichier du driver dans les moteurs (quand ils ont
+  perdu leur calibration mais que le fichier est bon) ;
+- `recalibrate_arm.py` : recalibration complète, interactive (même procédure que `lerobot-calibrate`) ;
+- `monitor_positions.py` : positions brutes des 6 moteurs en direct, driver arrêté ;
+- `touch_table.py` : hauteur de la table dans le repère robot, pince verticale (-> `table` de
+  `ros2_ws/calibration/workspace.yaml`) ;
+- `compare_touch.py` : écart entre le cube vu par la caméra et la pointe de la pince posée dessus
+  (-> `xy_offset` de `workspace.yaml`) ;
+- `hover_object.py` : met la pince au-dessus du cube vu par la perception (test avant une prise) ;
+- `hsv_tune.py` (`./run.sh hsv`) : seuils de couleur sous la vraie lumière -> `ros2_ws/config/perception_real.yaml` ;
+- `wait_topic.py` : utilisé par `run.sh` pour attendre que la perception publie.
 
 Comportement du driver sur le vrai bras (LeRobot `SO101Follower`) :
 - à la connexion le couple est **activé** : le bras tient sa position et ne bouge que sur

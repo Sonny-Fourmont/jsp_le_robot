@@ -4,11 +4,14 @@
 #   ./run.sh cube          simulation phase 1 (cube + boite) : conteneurs, RViz, shell ROS
 #   ./run.sh ouija         simulation phase 2 (planche Ouija + ollama) : idem
 #   ./run.sh real          vrai bras + camera USB, avec les valeurs du .env
-#   ./run.sh video [N] [main|rviz]  simu cube + enregistre N pick & place dans ros2_ws/rec/pick_place_sim.mp4
+#   ./run.sh video [N] [main|rviz|grid]  simu cube + enregistre N pick & place dans ros2_ws/rec/pick_place_sim.mp4
+#       grid = 1920x1080, scene MuJoCo + RViz (TF, FK) + camera + detection : ce que demande le prof
 #                          main : vue 3D MuJoCo seule (pick_place_sim_main.mp4)
 #                          rviz : vue RViz (TF + FK du TCP, pick_place_rviz.mp4), rviz2 tourne sans ecran dans le conteneur
 #   ./run.sh video-ouija ["question"] [REPONSE]  simu ouija + video de la reponse epelee dans ros2_ws/rec/ouija_demo.mp4
-#                          (main : vue 3D seule, plein cadre, fichier pick_place_sim_main.mp4)
+#   ./run.sh video-reel ["question"] [REPONSE|LLM]  VRAI ROBOT (valeurs du .env) : video 1920x1080 RViz + camera +
+#                          detection pendant que le bras epelle REPONSE (LLM : la question passe par ollama)
+#                          -> ros2_ws/rec/ouija_reel.mp4. Filmer la scene au telephone en meme temps.
 #   ./run.sh hsv           regle les seuils HSV sur la vraie camera (fenetre, curseurs, s = sauver)
 #   ./run.sh rviz          ouvre RViz sur la stack en cours
 #   ./run.sh shell         shell ROS dans le conteneur control
@@ -121,8 +124,14 @@ case "${1:-}" in
            name=pick_place_sim; layout=""
            [ "${3:-}" = main ] && { name=pick_place_sim_main; layout=--main; }
            [ "${3:-}" = rviz ] && { name=pick_place_rviz; layout=--rviz; }
+           [ "${3:-}" = grid ] && { name=pick_place_grid; layout=--grid; }
            docker compose exec control bash -lc "$ROS_SRC && python3 /ros2_ws/tools/record_demo.py /ros2_ws/rec/$name.mp4 ${2:-3} $layout"
            echo ">> video : $(cd .. && pwd)/ros2_ws/rec/$name.mp4" ;;
+    video-reel) start real
+           [ "${3:-}" = LLM ] && docker compose up -d ollama >/dev/null 2>&1
+           flag=""; [ "${3:-}" = LLM ] && flag=--ask
+           docker compose exec control bash -lc "$ROS_SRC && python3 /ros2_ws/tools/record_ouija.py /ros2_ws/rec/ouija_reel.mp4 \"${2:-Qui est le meilleur groupe ?}\" \"${3:-NOUS}\" --real $flag"
+           echo ">> video : $(cd .. && pwd)/ros2_ws/rec/ouija_reel.mp4" ;;
     video-ouija) start ouija
            docker compose exec control bash -lc "$ROS_SRC && python3 /ros2_ws/tools/record_ouija.py /ros2_ws/rec/ouija_demo.mp4 \"${2:-Qui est le meilleur groupe ?}\" \"${3:-NOUS}\""
            echo ">> video : $(cd .. && pwd)/ros2_ws/rec/ouija_demo.mp4" ;;

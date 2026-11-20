@@ -12,9 +12,12 @@ Layouts:
              perception marker and the ground truth of the simulation (/debug/sim_markers). The
              caption compares the TCP position given by our FK (pinocchio, /end_effector_pose) with
              the TF of robot_state_publisher (same URDF, independent computation).
+  --grid     everything the teacher asks for in one 1920x1080 frame: the MuJoCo scene, RViz (URDF,
+             TF, FK marker, with the FK vs TF figures), the camera and the perception image, plus
+             the caption with the current step.
 Runs N randomized trials (/sim/randomize_object + /pick_and_place), checked with the ground truth
 like trial_pick_place.py. /brain/state is the caption.
-Usage: record_demo.py [out.mp4] [N] [--main|--rviz]
+Usage: record_demo.py [out.mp4] [N] [--main|--rviz|--grid]
 
     docker compose exec control bash -lc "source /opt/ros/jazzy/setup.bash && source /ros2_ws/install/setup.bash \
         && python3 /ros2_ws/tools/record_demo.py /ros2_ws/rec/pick_place_sim.mp4 3"
@@ -41,6 +44,7 @@ from tf2_ros import Buffer, TransformListener
 
 ASSETS = Path("/opt/so101/sim/so101_sim/assets/so101")
 RVIZ_CONFIG = os.environ.get("RVIZ_CONFIG", "/ros2_ws/so101_video.rviz")
+GRID_RVIZ_CONFIG = os.environ.get("RVIZ_CONFIG", "/ros2_ws/so101_grid.rviz")  # same, framed for a 960x494 panel
 ARM_JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
 URDF_GRIPPER_RANGE = (-0.174533, 1.74533)  # gripper in /joint_states (rad, URDF), see driver_node
 TCP_FRAME = "gripper_frame_link"
@@ -48,11 +52,15 @@ FPS = 20
 VIEW_W, VIEW_H = 960, 720  # 3D view of the panels layout (scene offscreen buffer is 1280x720)
 MAIN_W, MAIN_H = 1280, 720  # --main / --rviz: one view, full frame
 SIDE_W, SIDE_H = 480, 360  # camera + perception panels
+GRID_W, GRID_H = 1920, 1080  # --grid: title band, 2x2 panels of PW x PH, caption bar
+PW, PH = 960, 494
+GRID_TITLE_H, GRID_BAR_H = 40, 52
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 TITLES = {
     "panels": "SO-ARM101  pick & place en simulation (MuJoCo + ROS 2)",
     "main": "SO-ARM101  pick & place en simulation (MuJoCo + ROS 2)",
     "rviz": "SO-ARM101  pick & place vu dans RViz : modele URDF + TF, position du TCP par FK",
+    "grid": "SO-ARM101  pick & place en simulation : scene MuJoCo, RViz (URDF + TF + FK), camera, detection",
 }
 
 
@@ -70,10 +78,17 @@ def text(img, s, org, scale=0.7, color=(255, 255, 255), thick=2):
     cv2.putText(img, s, org, FONT, scale, color, thick, cv2.LINE_AA)
 
 
-def panel(img, w, h, label):
+def panel(img, w, h, label, fit=False):
+    """Image resized to w x h under a label band; fit=True keeps the aspect ratio (black bars)."""
     if img is None:
         out = np.full((h, w, 3), 40, np.uint8)
         text(out, "en attente...", (w // 2 - 90, h // 2), 0.8, (160, 160, 160))
+    elif fit and abs(img.shape[1] / img.shape[0] - w / h) > 0.02:
+        k = min(w / img.shape[1], h / img.shape[0])
+        rw, rh = int(img.shape[1] * k), int(img.shape[0] * k)
+        out = np.zeros((h, w, 3), np.uint8)
+        x0, y0 = (w - rw) // 2, (h - rh) // 2
+        out[y0:y0 + rh, x0:x0 + rw] = cv2.resize(img, (rw, rh), interpolation=cv2.INTER_AREA)
     else:
         out = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
     cv2.rectangle(out, (0, 0), (w, 34), (20, 20, 20), -1)
@@ -141,7 +156,7 @@ class DemoNode(Node):
 class MujocoView:
     """Off-screen MuJoCo rendering of the scene, replaying /joint_states and the cube's ground truth."""
 
-    def __init__(self, node, w, h, distance):
+    def __init__(self, node, w, h, distance, lookat=(0.13, -0.04, 0.04)):
         import mujoco
 
         self.node, self.mujoco = node, mujoco
@@ -151,7 +166,7 @@ class MujocoView:
         self.renderer = mujoco.Renderer(self.model, height=h, width=w)
         self.cam = mujoco.MjvCamera()
         self.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
-        self.cam.lookat[:] = (0.13, -0.04, 0.04)
+        self.cam.lookat[:] = lookat
         self.cam.distance, self.cam.azimuth, self.cam.elevation = distance, 160.0, -22.0
         self.qadr = {j: self.model.joint(j).qposadr[0] for j in ARM_JOINTS + ["gripper"]}
         self.cube = self.model.joint("pickup_object_free").qposadr[0]
@@ -300,9 +315,10 @@ class VideoWriter:
 
 
 class Recorder(threading.Thread):
-    def __init__(self, node, view, out, fps, layout):
+    def __init__(self, node, view, out, fps, layout, rviz=None):
         super().__init__(daemon=True)
         self.node, self.view, self.out, self.fps, self.layout = node, view, out, fps, layout
+        self.rviz = rviz  # --grid: RvizView next to the MuJoCo view
         self.stop = threading.Event()
         self.n = 0
         self.t0 = time.monotonic()
@@ -321,7 +337,51 @@ class Recorder(threading.Thread):
         if fk is not None and tf is not None:
             text(frame, f"ecart {np.linalg.norm(fk - tf) * 1000:.1f} mm", (x0 + 640, y0 + 24), 0.6, (120, 255, 150), 1)
 
+    @staticmethod
+    def _fk_lines(frame, fk, tf, x0, y0):
+        """Compact FK vs TF comparison (two lines), drawn inside the RViz panel of the grid."""
+        cv2.rectangle(frame, (x0 - 6, y0 - 22), (x0 + 640, y0 + 32), (20, 20, 20), -1)
+        fmt = lambda v: f"x {v[0]:+.3f}  y {v[1]:+.3f}  z {v[2]:+.3f} m" if v is not None else "..."  # noqa: E731
+        text(frame, f"TCP par FK (pinocchio, /end_effector_pose)  {fmt(fk)}", (x0, y0), 0.5, (160, 230, 255), 1)
+        gap = f"   ecart {np.linalg.norm(fk - tf) * 1000:.1f} mm" if fk is not None and tf is not None else ""
+        text(frame, f"TCP par TF (robot_state_publisher, URDF)    {fmt(tf)}{gap}", (x0, y0 + 24), 0.5,
+             (160, 230, 255), 1)
+
+    def _run_grid(self):
+        """--grid: MuJoCo scene | RViz over camera | perception, title band above, caption bar below."""
+        writer = VideoWriter(self.out, self.fps, GRID_W, GRID_H)
+        y1, y2 = GRID_TITLE_H, GRID_TITLE_H + PH
+        t_start = time.monotonic()
+        while not self.stop.is_set():
+            n = self.node
+            with n.lock:
+                q, gt_o, fk, cam_img, dbg_img = dict(n.q), n.gt_o, n.fk, n.cam, n.dbg
+                state, trial, verdict = n.state, n.trial, n.verdict
+            frame = np.zeros((GRID_H, GRID_W, 3), np.uint8)
+            frame[y1:y2, :PW] = panel(self.view.frame(q, gt_o), PW, PH, "Simulation MuJoCo (verite terrain)")
+            frame[y1:y2, PW:] = panel(self.rviz.frame(), PW, PH,
+                                      "RViz : modele URDF, TF de la pince, FK du TCP (/end_effector_markers)")
+            frame[y2:y2 + PH, :PW] = panel(cam_img, PW, PH, "Camera du dessus  /external_cam/image_raw", fit=True)
+            frame[y2:y2 + PH, PW:] = panel(dbg_img, PW, PH, "Perception  /perception/debug_image  (cube + boite -> 3D)",
+                                           fit=True)
+            self._fk_lines(frame, fk, n.tcp_from_tf(), PW + 12, y1 + 34 + 30)
+            text(frame, TITLES["grid"], (16, 30), 0.8)
+            cv2.rectangle(frame, (0, GRID_H - GRID_BAR_H), (GRID_W, GRID_H), (20, 20, 20), -1)
+            t = time.monotonic() - self.t0
+            head = f"Essai {trial[0]}/{trial[1]}   " if trial[1] else ""
+            text(frame, f"{head}Etat : {state}   {t:5.1f} s", (16, GRID_H - 18), 0.75, (255, 220, 120))
+            if verdict:
+                text(frame, verdict, (PW, GRID_H - 18), 0.75, (120, 255, 150))
+            due = int((time.monotonic() - t_start) * self.fps) + 1
+            for _ in range(max(1, due - self.n)):
+                writer.write(frame)
+                self.n += 1
+            time.sleep(max(0.0, t_start + self.n / self.fps - time.monotonic()))
+        writer.release()
+
     def run(self):
+        if self.layout == "grid":
+            return self._run_grid()
         one_view = self.layout in ("main", "rviz")
         view_w, view_h = (MAIN_W, MAIN_H) if one_view else (VIEW_W, VIEW_H)
         frame_w = view_w if one_view else VIEW_W + SIDE_W
@@ -363,7 +423,8 @@ class Recorder(threading.Thread):
 
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    layout = "rviz" if "--rviz" in sys.argv else "main" if "--main" in sys.argv else "panels"
+    layout = ("grid" if "--grid" in sys.argv else "rviz" if "--rviz" in sys.argv
+              else "main" if "--main" in sys.argv else "panels")
     out = args[0] if args else "/ros2_ws/rec/pick_place_sim.mp4"
     n_trials = int(args[1]) if len(args) > 1 else 3
     Path(out).parent.mkdir(parents=True, exist_ok=True)
@@ -387,24 +448,32 @@ def main():
         print("no /perception/debug_image: the perception node receives nothing, docker compose restart perception")
         return
 
+    rviz = None
     if layout == "rviz":
         view = RvizView(MAIN_W, MAIN_H, RVIZ_CONFIG, FPS)
-        print(f"rviz2 on virtual display {view.display}, waiting for the first frame...", flush=True)
-        view.wait_ready()
+    elif layout == "grid":
+        view = MujocoView(node, PW, PH, 0.80, lookat=(0.13, -0.04, 0.10))
+        rviz = RvizView(PW, PH, GRID_RVIZ_CONFIG, FPS)
     elif layout == "main":
         view = MujocoView(node, MAIN_W, MAIN_H, 0.66)
     else:
         view = MujocoView(node, VIEW_W, VIEW_H, 0.72)
 
     try:
-        ok = run_trials(node, view, out, n_trials, layout)
+        for v in (view, rviz):
+            if isinstance(v, RvizView):
+                print(f"rviz2 on virtual display {v.display}, waiting for the first frame...", flush=True)
+                v.wait_ready()
+        ok = run_trials(node, view, out, n_trials, layout, rviz)
     finally:
         view.close()
+        if rviz is not None:
+            rviz.close()
     rclpy.shutdown()
 
 
-def run_trials(node, view, out, n_trials, layout):
-    rec = Recorder(node, view, out, FPS, layout)
+def run_trials(node, view, out, n_trials, layout, rviz=None):
+    rec = Recorder(node, view, out, FPS, layout, rviz)
     rec.start()
     time.sleep(1.5)
     ok, lines = 0, []
