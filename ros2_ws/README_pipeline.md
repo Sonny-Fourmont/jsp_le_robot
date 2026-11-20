@@ -228,7 +228,7 @@ réglé avec `./run.sh hsv`). Nœud : `num_samples` 30, `min_markers` 3 (avec 2 
 l'erreur triple), `calib_file`.
 
 Sur le vrai robot, la séquence complète (intrinsèques au damier, feuille, calibration,
-vérification) est dans `docs/vrai_robot_jourJ.md`.
+vérification) est dans `docs/GUIDE_ROBOT_REEL.md`.
 
 ## Machine à états du brain
 
